@@ -1,14 +1,15 @@
 #!/usr/bin/env python
 """Optimize the rotaxane geometry with Meta's UMA MLIP via fairchem-core/ASE.
 
-Reads the assembled rotaxane XYZ produced by build_rotaxane.py, attaches a
-UMA calculator (uma-s-1p1, molecular 'omol' task), relaxes the structure with
-an ASE optimizer, and writes PyMOL-friendly outputs only:
-  - rotaxane_uma_clean.xyz : plain standard XYZ of the final relaxed frame
-                             (element + x y z, re-centered to the origin).
-  - rotaxane_uma.pdb       : multi-state PDB of every frame (initial + each
-                             optimization step), each re-centered, so PyMOL
-                             loads it as an animated trajectory (`mplay`).
+Reads the assembled rotaxane XYZ produced by build_rotaxane.py (<stem>_center.xyz
+by default), attaches a UMA calculator (uma-s-1p1, molecular 'omol' task),
+relaxes the structure with an ASE optimizer, and writes PyMOL-friendly outputs
+only (named from the input file's stem):
+  - <stem>_relaxed.xyz : plain standard XYZ of the final relaxed frame
+                         (element + x y z, re-centered to the origin).
+  - <stem>_relax.pdb   : multi-state PDB of every frame (initial + each
+                         optimization step), each re-centered, so PyMOL loads
+                         it as an animated trajectory (`mplay`).
 
 ASE's default XYZ writer emits extended XYZ (forces/lattice/long comment)
 which PyMOL misreads, so we write a plain XYZ by hand and a PDB instead.
@@ -29,28 +30,35 @@ from ase.io import read, write
 from ase.optimize import LBFGS
 from fairchem.core import pretrained_mlip, FAIRChemCalculator
 
+from rotaxane_paths import resolve_stem, out_path, default_smiles
+
 HERE = os.path.dirname(os.path.abspath(__file__))
-IN_FILE = os.path.join(HERE, "rotaxane.xyz")
-CLEAN_XYZ = os.path.join(HERE, "rotaxane_uma_clean.xyz")
-PDB_FILE = os.path.join(HERE, "rotaxane_uma.pdb")
+# Defaults follow the stem-driven naming: a bare run relaxes
+# <stem>_center.xyz (stem from rot_smiles.txt) -> <stem>_relaxed.xyz +
+# <stem>_relax.pdb. The stem is recovered from --input, so pointing --input at
+# any pipeline .xyz names its outputs from that file's stem.
+IN_FILE = out_path("rot_smiles", "center", "xyz")
 SMILES_FILE = os.path.join(HERE, "rot_smiles.txt")
 
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--input", default=IN_FILE,
-                   help="starting geometry (default: rotaxane.xyz)")
-    p.add_argument("--out-xyz", default=CLEAN_XYZ,
-                   help="plain-XYZ output of the final frame")
-    p.add_argument("--out-pdb", default=PDB_FILE,
-                   help="multi-state PDB output of the whole relaxation")
+                   help="starting geometry (default: <stem>_center.xyz). "
+                        "Outputs are named from this file's stem.")
+    p.add_argument("--out-xyz", default=None,
+                   help="plain-XYZ output of the final frame "
+                        "(default: <stem>_relaxed.xyz)")
+    p.add_argument("--out-pdb", default=None,
+                   help="multi-state PDB output of the whole relaxation "
+                        "(default: <stem>_relax.pdb)")
     p.add_argument("--fmax", type=float, default=FMAX,
                    help="force convergence tolerance in eV/A (default 0.05)")
     p.add_argument("--steps", type=int, default=STEPS,
                    help="max optimization steps (default 200)")
-    p.add_argument("--smiles", default=SMILES_FILE,
+    p.add_argument("--smiles", default=None,
                    help="rod:/wheel: file to read optional charge/spin from "
-                        "(default: rot_smiles.txt)")
+                        "(default: <stem>.txt matching the input)")
     return p.parse_args()
 
 MODEL = "uma-s-1p1"          # UMA small checkpoint (auto-downloaded from HF)
@@ -128,12 +136,17 @@ def main():
     # so we can give a clear error before downloading the checkpoint.
     get_hf_token()
 
+    stem = resolve_stem(args.input)
+    out_xyz = args.out_xyz or out_path(stem, "relaxed", "xyz")
+    out_pdb = args.out_pdb or out_path(stem, "relax", "pdb")
+    smiles_file = args.smiles or default_smiles(stem)
+
     atoms = read(args.input)
     atoms.set_pbc(False)
     atoms.center(vacuum=VACUUM)  # large non-periodic box; no self-images
     # Charge / spin for the combined rotaxane: read from the SMILES file if
     # present, else defaults (neutral, closed-shell).
-    charge, spin = read_charge_spin(args.smiles)
+    charge, spin = read_charge_spin(smiles_file)
     atoms.info["charge"] = charge
     atoms.info["spin"] = spin
 
@@ -167,14 +180,14 @@ def main():
           f"(steps={opt.get_number_of_steps()})")
 
     # Plain XYZ of the final relaxed frame (centered).
-    write_plain_xyz(args.out_xyz, centered_copy(atoms),
+    write_plain_xyz(out_xyz, centered_copy(atoms),
                     comment=f"rotaxane UMA-relaxed  E={e1:.6f} eV  "
                             f"max|F|={f1:.4f} eV/A  "
                             f"input={os.path.basename(args.input)}")
     # Multi-state PDB of the whole relaxation (each frame centered).
-    write(args.out_pdb, [centered_copy(a) for a in frames])
-    print(f"wrote {args.out_xyz} (final frame)")
-    print(f"wrote {args.out_pdb} ({len(frames)} states)")
+    write(out_pdb, [centered_copy(a) for a in frames])
+    print(f"wrote {out_xyz} (final frame)")
+    print(f"wrote {out_pdb} ({len(frames)} states)")
 
 
 if __name__ == "__main__":

@@ -1,10 +1,11 @@
 #!/usr/bin/env python
 """Build a rotaxane XYZ structure from rod + wheel SMILES.
 
-Reads two SMILES (rod, then wheel) from rot_smiles.txt, generates 3D
-structures with RDKit, aligns the rod's long axis to x and the wheel's
-2D plane to yz, co-centroids the two, checks for steric overlap, and
-writes the combined molecule in XYZ format.
+Reads two SMILES (rod, then wheel) from a .txt file (default rot_smiles.txt),
+generates 3D structures with RDKit, aligns the rod's long axis to x and the
+wheel's 2D plane to yz, co-centroids the two, checks for steric overlap, and
+writes the combined molecule in XYZ format. Output is <stem>_center.xyz where
+<stem> is derived from the input filename (e.g. rot1.txt -> rot1_center.xyz).
 """
 
 import argparse
@@ -14,9 +15,10 @@ import numpy as np
 from rdkit import Chem
 from rdkit.Chem import AllChem
 
+from rotaxane_paths import resolve_stem, out_path
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 SMILES_FILE = os.path.join(HERE, "rot_smiles.txt")
-OUT_FILE = os.path.join(HERE, "rotaxane.xyz")
 
 # Distance (A) below which a rod/wheel atom pair is flagged as overlapping.
 OVERLAP_THRESHOLD = 1.0
@@ -139,16 +141,20 @@ def optimize_wheel_offset(rod_pos, wheel_centered, d0, base,
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--smiles", default=SMILES_FILE,
-                   help="rod:/wheel: SMILES file (default: rot_smiles.txt)")
-    p.add_argument("--out", default=OUT_FILE,
-                   help="output XYZ path (default: rotaxane.xyz)")
+                   help="rod:/wheel: SMILES file (default: rot_smiles.txt). "
+                        "Output names are derived from this file's stem "
+                        "(e.g. rot1.txt -> rot1_center.xyz).")
+    p.add_argument("--out", default=None,
+                   help="output XYZ path (default: <stem>_center.xyz, derived "
+                        "from the --smiles filename)")
     return p.parse_args()
 
 
 def main():
     args = parse_args()
     smiles_file = args.smiles
-    out_file = args.out
+    stem = resolve_stem(smiles_file)
+    out_file = args.out or out_path(stem, "center", "xyz")
     rod_smi, wheel_smi = read_smiles(smiles_file)
     print(f"rod SMILES  : {rod_smi}")
     print(f"wheel SMILES: {wheel_smi}")

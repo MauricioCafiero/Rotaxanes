@@ -2,10 +2,12 @@
 """Run molecular dynamics on the UMA-relaxed rotaxane, using UMA for forces.
 
 Defaults to a short test run (Langevin NVT at 300 K, 0.5 fs step, 100 fs).
-Step size and total length are CLI options. Outputs PyMOL-friendly files only:
-  - rotaxane_md_clean.xyz : plain standard XYZ of the final frame.
-  - rotaxane_md.pdb       : multi-state PDB trajectory (one state every
-                            `--stride` steps); `mplay` in PyMOL to animate.
+Step size and total length are CLI options. Outputs PyMOL-friendly files only,
+named from the input file's stem (e.g. rot1_relaxed.xyz -> rot1_md.xyz +
+rot1_md.pdb):
+  - <stem>_md.xyz : plain standard XYZ of the final frame.
+  - <stem>_md.pdb : multi-state PDB trajectory (one state every `--stride`
+                    steps); `mplay` in PyMOL to animate.
 
 Requires HF_TOKEN in the environment (see optimize_uma.py / CLAUDE.md).
 """
@@ -28,7 +30,6 @@ from optimize_uma import (
     MODEL,
     TASK,
     VACUUM,
-    SMILES_FILE,
     centered_copy,
     get_hf_token,
     np_max_force,
@@ -37,17 +38,17 @@ from optimize_uma import (
     write_plain_xyz,
 )
 from displace_wheel import fragment_counts, rod_axis
+from rotaxane_paths import resolve_stem, out_path, default_smiles
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_IN = os.path.join(HERE, "rotaxane_uma_clean.xyz")
-CLEAN_XYZ = os.path.join(HERE, "rotaxane_md_clean.xyz")
-PDB_FILE = os.path.join(HERE, "rotaxane_md.pdb")
+DEFAULT_IN = out_path("rot_smiles", "relaxed", "xyz")
 
 
 def parse_args():
     p = argparse.ArgumentParser(description="UMA-driven MD on the rotaxane.")
     p.add_argument("--input", default=DEFAULT_IN,
-                   help="starting geometry (default: rotaxane_uma_clean.xyz)")
+                   help="starting geometry (default: <stem>_relaxed.xyz). "
+                        "Outputs are named from this file's stem.")
     p.add_argument("--dt", type=float, default=0.5,
                    help="timestep in fs (default 0.5)")
     p.add_argument("--time", type=float, default=100.0,
@@ -66,10 +67,15 @@ def parse_args():
                         "killed/aborted run keeps its trajectory (default 100)")
     p.add_argument("--seed", type=int, default=0xC0FFEE,
                    help="RNG seed for initial velocities (default 0xC0FFEE)")
-    p.add_argument("--out-xyz", default=CLEAN_XYZ,
-                   help="plain-XYZ output of the final frame")
-    p.add_argument("--out-pdb", default=PDB_FILE,
-                   help="multi-state PDB output of the trajectory")
+    p.add_argument("--out-xyz", default=None,
+                   help="plain-XYZ output of the final frame "
+                        "(default: <stem>_md.xyz)")
+    p.add_argument("--out-pdb", default=None,
+                   help="multi-state PDB output of the trajectory "
+                        "(default: <stem>_md.pdb)")
+    p.add_argument("--smiles", default=None,
+                   help="rod:/wheel: file for atom counts + charge/spin "
+                        "(default: <stem>.txt matching the input)")
     return p.parse_args()
 
 
@@ -100,10 +106,15 @@ def main():
     args = parse_args()
     get_hf_token()
 
+    stem = resolve_stem(args.input)
+    out_xyz = args.out_xyz or out_path(stem, "md", "xyz")
+    out_pdb = args.out_pdb or out_path(stem, "md", "pdb")
+    smiles_path = args.smiles or default_smiles(stem)
+
     atoms = read(args.input)
     atoms.set_pbc(False)
     atoms.center(vacuum=VACUUM)
-    charge, spin = read_charge_spin(SMILES_FILE)
+    charge, spin = read_charge_spin(smiles_path)
     atoms.info["charge"] = charge
     atoms.info["spin"] = spin
 
@@ -123,7 +134,7 @@ def main():
 
     steps = max(1, int(round(args.time / args.dt)))
     # Rod/wheel split for the wheel-position-along-rod shuttle log.
-    rod_n, _wheel_n = fragment_counts()
+    rod_n, _wheel_n = fragment_counts(smiles_path)
     assert len(atoms) == rod_n + _wheel_n, (
         f"atom count {len(atoms)} != rod {rod_n} + wheel {_wheel_n}; "
         "rot_smiles.txt must match the input geometry")
@@ -177,8 +188,8 @@ def main():
     def flush_outputs():
         try:
             if frames:
-                write(args.out_pdb, [centered_copy(a) for a in frames])
-            write_plain_xyz(args.out_xyz, centered_copy(atoms),
+                write(out_pdb, [centered_copy(a) for a in frames])
+            write_plain_xyz(out_xyz, centered_copy(atoms),
                             comment=f"rotaxane MD (partial) "
                                     f"thermostat={args.thermostat} "
                                     f"dt={args.dt}fs step="
@@ -204,14 +215,14 @@ def main():
           f"T={kinetic_temperature(atoms):.1f} K  "
           f"max|F|={np_max_force(atoms):.4f} eV/A")
 
-    write_plain_xyz(args.out_xyz, centered_copy(atoms),
+    write_plain_xyz(out_xyz, centered_copy(atoms),
                     comment=f"rotaxane MD final  thermostat={args.thermostat} "
                             f"dt={args.dt}fs time={args.time}fs "
                             f"T={args.temperature}K  E_tot={ep + ek:.4f} eV  "
                             f"input={os.path.basename(args.input)}")
-    write(args.out_pdb, [centered_copy(a) for a in frames])
-    print(f"wrote {args.out_xyz} (final frame)")
-    print(f"wrote {args.out_pdb} ({len(frames)} states)")
+    write(out_pdb, [centered_copy(a) for a in frames])
+    print(f"wrote {out_xyz} (final frame)")
+    print(f"wrote {out_pdb} ({len(frames)} states)")
 
 
 if __name__ == "__main__":

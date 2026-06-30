@@ -21,6 +21,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from ase.io import read
 
+from rotaxane_paths import resolve_stem, out_path
+
 HERE = Path(__file__).resolve().parent
 LOG_RE = re.compile(
     r"step\s+(\d+).*E_pot=([-\d.eE]+)\s+E_kin=([-\d.eE]+)\s+E_tot=([-\d.eE]+)"
@@ -30,12 +32,16 @@ LOG_RE = re.compile(
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--log", default=str(HERE / "shuttle_md.log"))
-    p.add_argument("--pdb", default=str(HERE / "rotaxane_md_shuttle.pdb"))
+    p.add_argument("--log", default=None,
+                   help="MD stdout log (default: <stem>_md.log, stem from --pdb)")
+    p.add_argument("--pdb", default=str(out_path("rot_smiles", "md", "pdb")),
+                   help="multi-state PDB trajectory (default: <stem>_md.pdb). "
+                        "The stem also sets --log and --prefix defaults.")
     p.add_argument("--dt", type=float, default=1.0, help="MD timestep in fs")
     p.add_argument("--log-interval", type=int, default=10,
                    help="log lines per MD step (default 10)")
-    p.add_argument("--prefix", default="md_", help="output filename prefix")
+    p.add_argument("--prefix", default=None,
+                   help="output filename prefix (default: <stem>_md_)")
     p.add_argument("--no-rmsd", action="store_true",
                    help="skip RMSD (don't read the PDB)")
     return p.parse_args()
@@ -72,9 +78,12 @@ def read_log(path):
 
 def main():
     args = parse_args()
-    steps, rows = read_log(args.log)
+    stem = resolve_stem(args.pdb)
+    log = args.log or out_path(stem, "md", "log")
+    prefix = args.prefix or f"{stem}_md_"
+    steps, rows = read_log(log)
     if not steps:
-        raise SystemExit(f"no log lines parsed from {args.log}")
+        raise SystemExit(f"no log lines parsed from {log}")
     t = np.array(steps, dtype=float) * args.dt  # fs
     T = np.array([rows[s]["t"] for s in steps])
     ep = np.array([rows[s]["ep"] for s in steps])
@@ -112,7 +121,7 @@ def main():
     ax.set_title(f"MD temperature  (T0 = {T[0]:.0f} K)")
     ax.legend()
     fig.tight_layout()
-    fig.savefig(f"{args.prefix}temperature.png")
+    fig.savefig(f"{prefix}temperature.png")
     plt.close(fig)
 
     # 2. energy (normalized to the first value = 0, so the drift is readable)
@@ -127,7 +136,7 @@ def main():
     ax.set_title("MD energies  (normalized: first value = 0)")
     ax.legend()
     fig.tight_layout()
-    fig.savefig(f"{args.prefix}energy.png")
+    fig.savefig(f"{prefix}energy.png")
     plt.close(fig)
 
     # 3. wheel displacement along the rod
@@ -140,7 +149,7 @@ def main():
         ax.set_title("Wheel shuttle along the rod  "
                      "(+ = toward rod center)")
         fig.tight_layout()
-        fig.savefig(f"{args.prefix}wheel.png")
+        fig.savefig(f"{prefix}wheel.png")
         plt.close(fig)
 
     # 4. RMSD
@@ -151,7 +160,7 @@ def main():
         ax.set_ylabel("RMSD vs frame 0 (A)")
         ax.set_title("Whole-structure RMSD (Kabsch-aligned)")
         fig.tight_layout()
-        fig.savefig(f"{args.prefix}rmsd.png")
+        fig.savefig(f"{prefix}rmsd.png")
         plt.close(fig)
 
     # combined overview
@@ -180,9 +189,9 @@ def main():
         ax.set_xlabel("time (fs)")
     fig.suptitle("Rotaxane shuttle MD (5 ps, 500 K Langevin)", y=1.0)
     fig.tight_layout()
-    fig.savefig(f"{args.prefix}overview.png")
+    fig.savefig(f"{prefix}overview.png")
     plt.close(fig)
-    print("wrote:", *[f"{args.prefix}{n}.png" for n in
+    print("wrote:", *[f"{prefix}{n}.png" for n in
           ("temperature", "energy", "wheel", "rmsd", "overview")])
 
 
