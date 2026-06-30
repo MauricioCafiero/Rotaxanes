@@ -199,6 +199,8 @@ points). The landscape is **multi-well** (`rot_smiles_scan.png` /
   just the display if the spike flattens the plot (the CSV keeps the true
   values).
 
+![Rotaxane 1 shuttle scan: relaxed UMA energy vs wheel position](rot_smiles_scan.png)
+
 ### Rotaxane 2 (`rot_smiles2.txt`) -- 114 atoms (rod 58 + wheel 56), rod 16.8 A
 
 Relaxation converges to E = -105800.86 eV, max|F| = 0.058 eV/A (200 steps,
@@ -213,6 +215,8 @@ fewer bulky features to create them.
 The contrast between the two -- multi-well on the long, feature-rich rod vs
 single-well on the short, plain rod -- is exactly what the scan is meant to
 surface, and it tracks the rod length (28.6 A vs 16.8 A) and feature count.
+
+![Rotaxane 2 shuttle scan: relaxed UMA energy vs wheel position](rot_smiles2_scan.png)
 
 ### Shuttle MD demo (legacy run)
 
@@ -229,10 +233,6 @@ naming; the stem-driven equivalent is
 (regenerate with `plot_md.py`).
 
 ## Plots
-
-![Rotaxane 1 shuttle scan: relaxed UMA energy vs wheel position](rot_smiles_scan.png)
-
-![Rotaxane 2 shuttle scan: relaxed UMA energy vs wheel position](rot_smiles2_scan.png)
 
 ![MD temperature](md_temperature.png)
 
