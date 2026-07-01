@@ -115,17 +115,12 @@ Notes:
 .venv/bin/python run_md.py --input <stem>_displaced_relaxed.xyz
 ```
 
-`build_rotaxane.py` options: `--smiles` (input .txt, sets the stem), `--out`.
-`optimize_uma.py` options: `--input`, `--out-xyz`, `--out-pdb`, `--fmax`,
-`--steps`, `--smiles` (charge/spin source). `displace_wheel.py` options:
-`--side` (left|right|farther), `--margin`, `--input`, `--out`, `--scan-grid`
-(A, default 0.5), `--scan-pad` (A, default 0), `--scan-fmax` (eV/A, default
-0.5 -- loose, just relieves bad sterics), `--scan-steps` (default 20),
-`--scan-emax` (eV plot clip, default none), `--no-scan`, `--smiles`. `run_md.py` options: `--input`, `--out-xyz`,
-`--out-pdb`, `--dt` (fs), `--time` (fs), `--thermostat` (langevin|nve),
-`--temperature` (K), `--friction` (1/fs), `--stride`, `--flush` (rewrite PDB+XYZ
-every N steps so a killed run keeps its trajectory), `--seed`, `--smiles`.
-`plot_md.py` options: `--log`, `--pdb` (sets the stem), `--prefix`, `--dt`,
+- `build_rotaxane.py` options: `--smiles` (input .txt, sets the stem), `--out`.
+- `optimize_uma.py` options: `--input`, `--out-xyz`, `--out-pdb`, `--fmax`,
+`--steps`, `--smiles` (charge/spin source). 
+- `displace_wheel.py` options: `--side` (left|right|farther), `--margin`, `--input`, `--out`, `--scan-grid` (A, default 0.5), `--scan-pad` (A, default 0), `--scan-fmax` (eV/A, default 0.5 -- loose, just relieves bad sterics), `--scan-steps` (default 20), `--scan-emax` (eV plot clip, default none), `--no-scan`, `--smiles`. 
+- `run_md.py` options: `--input`, `--out-xyz`, `--out-pdb`, `--dt` (fs), `--time` (fs), `--thermostat` (langevin|nve), `--temperature` (K), `--friction` (1/fs), `--stride`, `--flush` (rewrite PDB+XYZ every N steps so a killed run keeps its trajectory), `--seed`, `--smiles`.
+- `plot_md.py` options: `--log`, `--pdb` (sets the stem), `--prefix`, `--dt`,
 `--log-interval`, `--no-rmsd`.
 
 ## Outputs
