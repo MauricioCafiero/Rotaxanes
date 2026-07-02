@@ -31,7 +31,6 @@ such sustained wall; the wheel is placed just before it (minus a safety margin).
 
 import argparse
 import csv
-import os
 
 import numpy as np
 from ase.io import read
@@ -40,7 +39,6 @@ from rdkit import Chem
 from build_rotaxane import read_smiles
 from rotaxane_paths import resolve_stem, out_path, default_smiles
 
-HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_IN = out_path("rot_smiles", "relaxed", "xyz")
 
 FLOOR = 1.0        # A; closer than this between a rod-wheel pair = overlap

@@ -4,25 +4,38 @@ Build a rotaxane (rod threaded through a wheel) from two SMILES, relax it with
 Meta's **UMA** ML potential, and run ab-initio-style MD with UMA forces.
 
 ```
-<stem>.txt  ─►  build_rotaxane.py  ─►  <stem>_center.xyz
+<stem>.txt  ─►  code/build_rotaxane.py  ─►  output_files/<stem>_center.xyz
+                                                │
+                                                ▼
+                          code/optimize_uma.py  ─►  output_files/<stem>_relaxed.xyz  (+ _relax.pdb)
+                                                │
+                (optional) code/displace_wheel.py  ─►  output_files/<stem>_displaced.xyz
+                                         │   └─►  images/<stem>_scan.png + output_files/<stem>_scan.csv
                                           │
-                                          ▼
-                          optimize_uma.py  ─►  <stem>_relaxed.xyz  (+ _relax.pdb)
-                                          │
-                (optional) displace_wheel.py  ─►  <stem>_displaced.xyz
-                                         │   └─►  <stem>_scan.png + _scan.csv  (energy vs position)
-                                          │
-                (optional) optimize_uma.py --input <stem>_displaced.xyz  ─►  relaxed displaced
-                                          │
-                                          ▼
-                              run_md.py  ─►  <stem>_md.xyz  (+ .pdb)
+                (optional) code/optimize_uma.py --input <stem>_displaced.xyz  ─►  relaxed displaced
+                                                │
+                                                ▼
+                              code/run_md.py  ─►  output_files/<stem>_md.xyz  (+ .pdb)
 ```
 
+The repo is organised into three folders:
+
+- `code/` -- the pipeline scripts (`build_rotaxane.py`, `optimize_uma.py`,
+  `displace_wheel.py`, `run_md.py`, `plot_md.py`, `rotaxane_paths.py`).
+- `output_files/` -- generated run data: structures (`.xyz`), trajectories
+  (`.pdb`), scan tables (`.csv`), and logs (`.log`).
+- `images/` -- all plots (`.png`) and figures.
+
+The input `<stem>.txt` files stay at the project root (next to this README);
+everything the scripts generate is filed into `output_files/` or `images/`
+automatically by `rotaxane_paths.py`.
+
 All output filenames are derived from the input `.txt` file's **stem** (its
-basename without `.txt`): feed it `rot1.txt` and you get `rot1_center.xyz`,
-`rot1_relaxed.xyz`, `rot1_displaced.xyz`, `rot1_md.*`, etc. Each stage recovers
-the stem from the `.xyz` it reads (by stripping the role suffix) and names its
-own outputs `<stem>_<role>.<ext>`. The default stem is `rot_smiles`
+basename without `.txt`): feed it `rot1.txt` and you get
+`output_files/rot1_center.xyz`, `output_files/rot1_relaxed.xyz`,
+`output_files/rot1_displaced.xyz`, `output_files/rot1_md.*`, etc. Each stage
+recovers the stem from the `.xyz` it reads (by stripping the role suffix) and
+names its own outputs `<stem>_<role>.<ext>`. The default stem is `rot_smiles`
 (from `rot_smiles.txt`); the older `rotaxane*` files are legacy.
 
 ## Demo: SMILES → 3D
@@ -41,7 +54,7 @@ rod:   O=C(C(C(F)=C1)=CC=C1C(C=C2)=CC=C2C(C=C3)=CC=C3C4=CC(F)=C(C(N(CC5=CC(C(F)(
 wheel: O1CCOCCOCCOCCOCCOCCOCCOCC1
 ```
 
-![Rotaxane 1](Rotaxane1.png)
+![Rotaxane 1](images/Rotaxane1.png)
 
 ### Rotaxane 2 (`rot_smiles2.txt`) — 114 atoms (rod 58 + wheel 56)
 
@@ -50,7 +63,7 @@ rod:   O=C(C(C(F)=C1)=CC(F)=C1C(N(CC2=CC(C(F)(F)F)=CC(C(F)(F)F)=C2)[H])=O)N(CC3=
 wheel: O1CCOCCOCCOCCOCCOCCOCCOCC1
 ```
 
-![Rotaxane 2](Rotaxane2.png)
+![Rotaxane 2](images/Rotaxane2.png)
 
 (The wheel is the same 24-crown-8 in both; only the rod differs.)
 
@@ -83,36 +96,38 @@ export HF_TOKEN=<your huggingface token>   # put in ~/.zshrc
 
 Notes:
 - `fairchem-core` requires Python **<3.14**, so the env is 3.12 (not the
-  system 3.14). Run scripts with `.venv/bin/python <script>`.
+  system 3.14). Run scripts with `.venv/bin/python code/<script>` from the
+  project root.
 - `fairchem`'s MLIP predict unit only accepts `cpu` or `cuda` — Apple Silicon
   **MPS is not supported**. Device auto-selects `cuda` if available else `cpu`.
 
 ## Usage
 
 ```sh
-# 1. assemble the rotaxane from SMILES (RDKit) -> <stem>_center.xyz
-.venv/bin/python build_rotaxane.py                       # stem from rot_smiles.txt
-.venv/bin/python build_rotaxane.py --smiles rot1.txt     # -> rot1_center.xyz
+# 1. assemble the rotaxane from SMILES (RDKit) -> output_files/<stem>_center.xyz
+.venv/bin/python code/build_rotaxane.py                       # stem from rot_smiles.txt
+.venv/bin/python code/build_rotaxane.py --smiles rot1.txt     # -> output_files/rot1_center.xyz
 
-# 2. relax with UMA -> <stem>_relaxed.xyz + <stem>_relax.pdb
-.venv/bin/python optimize_uma.py                         # reads <stem>_center.xyz
-.venv/bin/python optimize_uma.py --input rot1_center.xyz # -> rot1_relaxed.xyz
+# 2. relax with UMA -> output_files/<stem>_relaxed.xyz + output_files/<stem>_relax.pdb
+.venv/bin/python code/optimize_uma.py                         # reads <stem>_center.xyz
+.venv/bin/python code/optimize_uma.py --input output_files/rot1_center.xyz
 
 # 3. (optional) relaxed stability-vs-position scan + slide to a steric extreme
-.venv/bin/python displace_wheel.py                       # relaxed UMA scan (HF_TOKEN)
-.venv/bin/python displace_wheel.py --scan-grid 0.25      # finer landscape
-.venv/bin/python displace_wheel.py --no-scan             # placement only
+.venv/bin/python code/displace_wheel.py                       # relaxed UMA scan (HF_TOKEN)
+.venv/bin/python code/displace_wheel.py --scan-grid 0.25      # finer landscape
+.venv/bin/python code/displace_wheel.py --no-scan             # placement only
 #    at each wheel station the wheel is pinned along the rod and UMA relaxes it
 #    in the perpendicular plane (loose fmax) to relieve bad sterics, then records
-#    the energy -> <stem>_scan.png + <stem>_scan.csv  and  <stem>_displaced.xyz
+#    the energy -> images/<stem>_scan.png + output_files/<stem>_scan.csv
+#    and output_files/<stem>_displaced.xyz
 
 # 3b. (optional) relax the displaced structure (auto-names _displaced_relaxed)
-.venv/bin/python optimize_uma.py --input <stem>_displaced.xyz
+.venv/bin/python code/optimize_uma.py --input output_files/<stem>_displaced.xyz
 
-# 4. MD with UMA forces -> <stem>_md.xyz + <stem>_md.pdb
-.venv/bin/python run_md.py                               # defaults: 0.5 fs, 100 fs, Langevin 300 K
-.venv/bin/python run_md.py --time 1000 --dt 1.0 --thermostat nve
-.venv/bin/python run_md.py --input <stem>_displaced_relaxed.xyz
+# 4. MD with UMA forces -> output_files/<stem>_md.xyz + output_files/<stem>_md.pdb
+.venv/bin/python code/run_md.py                               # defaults: 0.5 fs, 100 fs, Langevin 300 K
+.venv/bin/python code/run_md.py --time 1000 --dt 1.0 --thermostat nve
+.venv/bin/python code/run_md.py --input output_files/<stem>_displaced_relaxed.xyz
 ```
 
 - `build_rotaxane.py` options: `--smiles` (input .txt, sets the stem), `--out`.
@@ -128,20 +143,21 @@ Notes:
 All geometry outputs are **PyMOL-friendly**: plain standard XYZ (element +
 x y z) and multi-state PDB (one state per step; `load` then `mplay` in PyMOL).
 ASE's extended XYZ (forces + long `Lattice/Properties` comment) is deliberately
-avoided because PyMOL misreads it.
+avoided because PyMOL misreads it. Structures, trajectories, CSVs and logs land
+in `output_files/`; plots (`.png`) land in `images/`.
 
 | file | from | content |
 |---|---|---|
-| `<stem>_center.xyz` | build_rotaxane.py | assembled, sterics-optimised |
-| `<stem>_relaxed.xyz` | optimize_uma.py | UMA-relaxed final frame |
-| `<stem>_relax.pdb` | optimize_uma.py | relaxation trajectory |
-| `<stem>_scan.png` / `_scan.csv` | displace_wheel.py | relaxed UMA wheel energy vs position (stability scan) |
-| `<stem>_displaced.xyz` | displace_wheel.py | wheel slid to a steric extreme |
-| `<stem>_displaced_relaxed.xyz` | optimize_uma.py (on displaced) | UMA-relaxed displaced frame (strain-free MD start) |
-| `<stem>_displaced_relax.pdb` | optimize_uma.py (on displaced) | displaced-structure relaxation trajectory |
-| `<stem>_md.xyz` | run_md.py | MD final frame |
-| `<stem>_md.pdb` | run_md.py | MD trajectory |
-| `<stem>_md_*.png` | plot_md.py | temperature / energy / wheel / RMSD / overview plots |
+| `output_files/<stem>_center.xyz` | build_rotaxane.py | assembled, sterics-optimised |
+| `output_files/<stem>_relaxed.xyz` | optimize_uma.py | UMA-relaxed final frame |
+| `output_files/<stem>_relax.pdb` | optimize_uma.py | relaxation trajectory |
+| `images/<stem>_scan.png` / `output_files/<stem>_scan.csv` | displace_wheel.py | relaxed UMA wheel energy vs position (stability scan) |
+| `output_files/<stem>_displaced.xyz` | displace_wheel.py | wheel slid to a steric extreme |
+| `output_files/<stem>_displaced_relaxed.xyz` | optimize_uma.py (on displaced) | UMA-relaxed displaced frame (strain-free MD start) |
+| `output_files/<stem>_displaced_relax.pdb` | optimize_uma.py (on displaced) | displaced-structure relaxation trajectory |
+| `output_files/<stem>_md.xyz` | run_md.py | MD final frame |
+| `output_files/<stem>_md.pdb` | run_md.py | MD trajectory |
+| `images/<stem>_md_*.png` | plot_md.py | temperature / energy / wheel / RMSD / overview plots |
 
 Generated structure files are gitignored (regenerate by running the scripts).
 
@@ -152,10 +168,10 @@ name collisions — just point the pipeline at its `.txt` and every stage derive
 its outputs from that file's stem:
 
 ```sh
-.venv/bin/python build_rotaxane.py --smiles rot_smiles2.txt   # -> rot_smiles2_center.xyz
-.venv/bin/python optimize_uma.py --input rot_smiles2_center.xyz
-.venv/bin/python displace_wheel.py --input rot_smiles2_relaxed.xyz
-.venv/bin/python run_md.py --input rot_smiles2_relaxed.xyz
+.venv/bin/python code/build_rotaxane.py --smiles rot_smiles2.txt   # -> output_files/rot_smiles2_center.xyz
+.venv/bin/python code/optimize_uma.py --input output_files/rot_smiles2_center.xyz
+.venv/bin/python code/displace_wheel.py --input output_files/rot_smiles2_relaxed.xyz
+.venv/bin/python code/run_md.py --input output_files/rot_smiles2_relaxed.xyz
 ```
 
 ## Results: shuttle stability scan (relaxed UMA)
@@ -175,9 +191,9 @@ from UMA (`uma-s-1p1`, `omol`), CPU.
 ### Rotaxane 1 (`rot_smiles.txt`) -- 144 atoms (rod 88 + wheel 56), rod 28.6 A
 
 Relaxation converges to E = -124662.29 eV, max|F| = 0.050 eV/A (84 steps,
-`rot_smiles_relaxed.xyz`). Scan travel: -left 10.35 A, +right 7.40 A (36
-points). The landscape is **multi-well** (`rot_smiles_scan.png` /
-`rot_smiles_scan.csv`):
+`output_files/rot_smiles_relaxed.xyz`). Scan travel: -left 10.35 A, +right 7.40 A (36
+points). The landscape is **multi-well** (`images/rot_smiles_scan.png` /
+`output_files/rot_smiles_scan.csv`):
 
 - global minimum at d ≈ 0 A (centred station, E_rel = 0) -- self-consistent
   with the relaxed geometry;
@@ -194,14 +210,14 @@ points). The landscape is **multi-well** (`rot_smiles_scan.png` /
   just the display if the spike flattens the plot (the CSV keeps the true
   values).
 
-![Rotaxane 1 shuttle scan: relaxed UMA energy vs wheel position](rot_smiles_scan.png)
+![Rotaxane 1 shuttle scan: relaxed UMA energy vs wheel position](images/rot_smiles_scan.png)
 
 ### Rotaxane 2 (`rot_smiles2.txt`) -- 114 atoms (rod 58 + wheel 56), rod 16.8 A
 
 Relaxation converges to E = -105800.86 eV, max|F| = 0.058 eV/A (200 steps,
-`rot_smiles2_relaxed.xyz`). Scan travel: -left 3.50 A, +right 2.65 A (13
+`output_files/rot_smiles2_relaxed.xyz`). Scan travel: -left 3.50 A, +right 2.65 A (13
 points). The shorter rod gives a **single-well** landscape
-(`rot_smiles2_scan.png` / `rot_smiles2_scan.csv`): one central minimum at
+(`images/rot_smiles2_scan.png` / `output_files/rot_smiles2_scan.csv`): one central minimum at
 d = 0 A (E_rel = 0), with walls rising fairly smoothly to +1.83 eV at the left
 stopper (d = -3.50 A) and +1.19 eV at the right (d = +2.50 A);
 accessible-window barrier = 1.83 eV. No secondary minima -- the short rod has
@@ -211,7 +227,7 @@ The contrast between the two -- multi-well on the long, feature-rich rod vs
 single-well on the short, plain rod -- is exactly what the scan is meant to
 surface, and it tracks the rod length (28.6 A vs 16.8 A) and feature count.
 
-![Rotaxane 2 shuttle scan: relaxed UMA energy vs wheel position](rot_smiles2_scan.png)
+![Rotaxane 2 shuttle scan: relaxed UMA energy vs wheel position](images/rot_smiles2_scan.png)
 
 ### Shuttle MD demo (legacy run)
 
@@ -224,20 +240,20 @@ the instantaneous temperature (corr = +0.06): the shuttle is an oscillator
 whose position is set by its dynamics and the steric landscape, not by
 moment-to-moment thermal energy. This run used the legacy `rotaxane_md_shuttle*`
 naming; the stem-driven equivalent is
-`run_md.py --input rot_smiles_displaced_relaxed.xyz`. Plots in `md_*.png`
-(regenerate with `plot_md.py`).
+`code/run_md.py --input output_files/rot_smiles_displaced_relaxed.xyz`. Plots in
+`images/md_*.png` (regenerate with `code/plot_md.py`).
 
 ## Plots
 
-![MD temperature](md_temperature.png)
+![MD temperature](images/md_temperature.png)
 
-![MD energies (normalised: first value = 0)](md_energy.png)
+![MD energies (normalised: first value = 0)](images/md_energy.png)
 
-![Wheel shuttle along the rod](md_wheel.png)
+![Wheel shuttle along the rod](images/md_wheel.png)
 
-![Whole-structure RMSD vs frame 0](md_rmsd.png)
+![Whole-structure RMSD vs frame 0](images/md_rmsd.png)
 
-![Overview: 2x2 panel](md_overview.png)
+![Overview: 2x2 panel](images/md_overview.png)
 
 ## Credits
 

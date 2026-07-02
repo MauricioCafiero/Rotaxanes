@@ -32,13 +32,12 @@ from fairchem.core import pretrained_mlip, FAIRChemCalculator
 
 from rotaxane_paths import resolve_stem, out_path, default_smiles
 
-HERE = os.path.dirname(os.path.abspath(__file__))
 # Defaults follow the stem-driven naming: a bare run relaxes
 # <stem>_center.xyz (stem from rot_smiles.txt) -> <stem>_relaxed.xyz +
 # <stem>_relax.pdb. The stem is recovered from --input, so pointing --input at
 # any pipeline .xyz names its outputs from that file's stem.
 IN_FILE = out_path("rot_smiles", "center", "xyz")
-SMILES_FILE = os.path.join(HERE, "rot_smiles.txt")
+SMILES_FILE = default_smiles("rot_smiles")
 
 
 def parse_args():

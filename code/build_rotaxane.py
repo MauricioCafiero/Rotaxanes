@@ -9,16 +9,14 @@ writes the combined molecule in XYZ format. Output is <stem>_center.xyz where
 """
 
 import argparse
-import os
 import sys
 import numpy as np
 from rdkit import Chem
 from rdkit.Chem import AllChem
 
-from rotaxane_paths import resolve_stem, out_path
+from rotaxane_paths import default_smiles, resolve_stem, out_path
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-SMILES_FILE = os.path.join(HERE, "rot_smiles.txt")
+SMILES_FILE = default_smiles("rot_smiles")  # output_files/rot_smiles.txt
 
 # Distance (A) below which a rod/wheel atom pair is flagged as overlapping.
 OVERLAP_THRESHOLD = 1.0
@@ -141,9 +139,9 @@ def optimize_wheel_offset(rod_pos, wheel_centered, d0, base,
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--smiles", default=SMILES_FILE,
-                   help="rod:/wheel: SMILES file (default: rot_smiles.txt). "
-                        "Output names are derived from this file's stem "
-                        "(e.g. rot1.txt -> rot1_center.xyz).")
+                   help="rod:/wheel: SMILES file (default: rot_smiles.txt at "
+                        "the project root). Output names are derived from this "
+                        "file's stem (e.g. rot1.txt -> output_files/rot1_center.xyz).")
     p.add_argument("--out", default=None,
                    help="output XYZ path (default: <stem>_center.xyz, derived "
                         "from the --smiles filename)")

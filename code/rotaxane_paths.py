@@ -8,11 +8,22 @@ they recover the stem by stripping that suffix, then name their own outputs
 
 This keeps a whole run's files linked by name without any hardcoded literals,
 so the pipeline runs unchanged on `rot1.txt`, `rot_smiles.txt`, etc.
+
+Repository layout (this module is the single source of truth for it): the
+scripts live in `code/` (this file's directory); the input `.txt` files live at
+the project root alongside the README; generated run data (structures /
+trajectories / logs / CSVs) lives in `output_files/`; plots (`.png`) live in
+`images/`. `out_path` auto-routes by extension so callers just ask for
+`<stem>_<role>.<ext>` and the file lands in the right folder.
 """
 
 import os
 
+# This file lives in code/; the project root is its parent.
 HERE = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(HERE)
+OUTPUT_DIR = os.path.join(PROJECT_ROOT, "output_files")
+IMAGES_DIR = os.path.join(PROJECT_ROOT, "images")
 
 # Role suffixes appended to the stem, longest first so resolve_stem strips the
 # most specific match (e.g. `_displaced_relaxed` before `_relaxed`).
@@ -44,12 +55,18 @@ def resolve_stem(path):
     return root
 
 
-def out_path(stem, role, ext, directory=HERE):
-    """`<directory>/<stem>_<role>.<ext>` (role="" -> no trailing underscore)."""
+def out_path(stem, role, ext, directory=None):
+    """`<directory>/<stem>_<role>.<ext>` (role="" -> no trailing underscore).
+
+    `directory` defaults to `images/` for `.png` and `output_files/` for
+    everything else, so plots and data files are filed automatically.
+    """
+    if directory is None:
+        directory = IMAGES_DIR if ext == "png" else OUTPUT_DIR
     suffix = f"_{role}" if role else ""
     return os.path.join(directory, f"{stem}{suffix}.{ext}")
 
 
-def default_smiles(stem, directory=HERE):
-    """Path to the SMILES/charge/spin .txt for a given stem."""
+def default_smiles(stem, directory=PROJECT_ROOT):
+    """Path to the SMILES/charge/spin .txt for a given stem (project root)."""
     return os.path.join(directory, f"{stem}.txt")

@@ -12,6 +12,7 @@ multi-state PDB trajectory, then writes:
 The log is emitted every `--log-interval` MD steps; time = step * dt (fs).
 """
 import argparse
+import os
 import re
 from pathlib import Path
 
@@ -21,9 +22,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from ase.io import read
 
-from rotaxane_paths import resolve_stem, out_path
+from rotaxane_paths import IMAGES_DIR, resolve_stem, out_path
 
-HERE = Path(__file__).resolve().parent
 LOG_RE = re.compile(
     r"step\s+(\d+).*E_pot=([-\d.eE]+)\s+E_kin=([-\d.eE]+)\s+E_tot=([-\d.eE]+)"
     r"\s+eV\s+T=([\d.]+)\s+K(?:\s+wheel_x=([-+\d.]+)\s+A\s+d=([-+\d.]+))?"
@@ -41,7 +41,7 @@ def parse_args():
     p.add_argument("--log-interval", type=int, default=10,
                    help="log lines per MD step (default 10)")
     p.add_argument("--prefix", default=None,
-                   help="output filename prefix (default: <stem>_md_)")
+                   help="output filename prefix (default: images/<stem>_md_)")
     p.add_argument("--no-rmsd", action="store_true",
                    help="skip RMSD (don't read the PDB)")
     return p.parse_args()
@@ -80,7 +80,7 @@ def main():
     args = parse_args()
     stem = resolve_stem(args.pdb)
     log = args.log or out_path(stem, "md", "log")
-    prefix = args.prefix or f"{stem}_md_"
+    prefix = args.prefix or os.path.join(IMAGES_DIR, f"{stem}_md_")
     steps, rows = read_log(log)
     if not steps:
         raise SystemExit(f"no log lines parsed from {log}")

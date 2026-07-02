@@ -40,7 +40,6 @@ from optimize_uma import (
 from displace_wheel import fragment_counts, rod_axis
 from rotaxane_paths import resolve_stem, out_path, default_smiles
 
-HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_IN = out_path("rot_smiles", "relaxed", "xyz")
 
 
