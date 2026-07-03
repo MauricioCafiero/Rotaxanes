@@ -56,7 +56,7 @@ wheel: O1CCOCCOCCOCCOCCOCCOCCOCC1
 
 ![Rotaxane 1](images/Rotaxane1.png)
 
-### Rotaxane 2 (`rot_smiles2.txt`) — 114 atoms (rod 58 + wheel 56)
+### Rotaxane 2 (`rot2.txt`) — 114 atoms (rod 58 + wheel 56)
 
 ```
 rod:   O=C(C(C(F)=C1)=CC(F)=C1C(N(CC2=CC(C(F)(F)F)=CC(C(F)(F)F)=C2)[H])=O)N(CC3=CC(C(F)(F)F)=CC(C(F)(F)F)=C3)[H]
@@ -112,17 +112,25 @@ Notes:
 .venv/bin/python code/optimize_uma.py                         # reads <stem>_center.xyz
 .venv/bin/python code/optimize_uma.py --input output_files/rot1_center.xyz
 
-# 3. (optional) relaxed stability-vs-position scan + slide to a steric extreme
-.venv/bin/python code/displace_wheel.py                       # relaxed UMA scan (HF_TOKEN)
-.venv/bin/python code/displace_wheel.py --scan-grid 0.25      # finer landscape
-.venv/bin/python code/displace_wheel.py --no-scan             # placement only
-#    at each wheel station the wheel is pinned along the rod and UMA relaxes it
-#    in the perpendicular plane (loose fmax) to relieve bad sterics, then records
-#    the energy -> images/<stem>_scan.png + output_files/<stem>_scan.csv
-#    and output_files/<stem>_displaced.xyz
+# 3. (optional) chain-seeded relaxed shuttle scan + place the wheel at a side well
+.venv/bin/python code/displace_wheel.py                       # chain scan; place at farther well (HF_TOKEN)
+.venv/bin/python code/displace_wheel.py --production          # 300-step floor -> reporting-quality well depths
+.venv/bin/python code/displace_wheel.py --side deeper         # place at the lowest-energy well instead
+.venv/bin/python code/displace_wheel.py --place-rigid          # legacy rigid stopper-wall placement (strained)
+.venv/bin/python code/displace_wheel.py --no-scan             # rigid placement only (skip the scan)
+#    two monotonic outward sweeps from the central relaxed minimum; each station
+#    is seeded from the previous relaxed geometry so the wheel threads through a
+#    stopper incrementally (a fresh rigid start past a stopper does not converge on
+#    CPU), and each sweep walks until the rod-tip wall (energy/contact cutoff).
+#    the wheel is held rigid and the rod endpoints anchored, so only the rod's
+#    internal flex relieves sterics; energies are reported in kcal/mol ->
+#    images/<stem>_scan.png (global-min + well markers) + output_files/<stem>_scan.csv;
+#    detected wells are printed with Eyring rate estimates, and the chosen well's
+#    scan-relaxed geometry -> output_files/<stem>_displaced.xyz (MD-ready)
 
-# 3b. (optional) relax the displaced structure (auto-names _displaced_relaxed)
+# 3b. (only with --place-rigid) relax the strained rigid placement (auto-names _displaced_relaxed)
 .venv/bin/python code/optimize_uma.py --input output_files/<stem>_displaced.xyz
+#    the well placement is already scan-relaxed and MD-ready -- skip this unless --place-rigid
 
 # 4. MD with UMA forces -> output_files/<stem>_md.xyz + output_files/<stem>_md.pdb
 .venv/bin/python code/run_md.py                               # defaults: 0.5 fs, 100 fs, Langevin 300 K
@@ -130,13 +138,81 @@ Notes:
 .venv/bin/python code/run_md.py --input output_files/<stem>_displaced_relaxed.xyz
 ```
 
-- `build_rotaxane.py` options: `--smiles` (input .txt, sets the stem), `--out`.
-- `optimize_uma.py` options: `--input`, `--out-xyz`, `--out-pdb`, `--fmax`,
-`--steps`, `--smiles` (charge/spin source). 
-- `displace_wheel.py` options: `--side` (left|right|farther), `--margin`, `--input`, `--out`, `--scan-grid` (A, default 0.5), `--scan-pad` (A, default 0), `--scan-fmax` (eV/A, default 0.5 -- loose, just relieves bad sterics), `--scan-steps` (default 20), `--scan-emax` (eV plot clip, default none), `--no-scan`, `--smiles`. 
-- `run_md.py` options: `--input`, `--out-xyz`, `--out-pdb`, `--dt` (fs), `--time` (fs), `--thermostat` (langevin|nve), `--temperature` (K), `--friction` (1/fs), `--stride`, `--flush` (rewrite PDB+XYZ every N steps so a killed run keeps its trajectory), `--seed`, `--smiles`.
-- `plot_md.py` options: `--log`, `--pdb` (sets the stem), `--prefix`, `--dt`,
-`--log-interval`, `--no-rmsd`.
+## Options
+
+Every script derives its output names from the input file's **stem**, so the
+common pattern is: `--input` (or `--smiles` for `build_rotaxane.py`) selects the
+system, and `--out*` / `--side` etc. select what is written. Defaults are shown
+in the second column.
+
+### `build_rotaxane.py` — assemble the rotaxane from SMILES (RDKit)
+
+| flag | default | description |
+|---|---|---|
+| `--smiles` | `rot_smiles.txt` | rod:/wheel: SMILES file at the project root. Its stem names all outputs (`rot1.txt` → `output_files/rot1_center.xyz`). |
+| `--out` | `<stem>_center.xyz` | output assembled-geometry XYZ path. |
+
+### `optimize_uma.py` — relax a geometry with UMA
+
+| flag | default | description |
+|---|---|---|
+| `--input` | `<stem>_center.xyz` | starting geometry; its stem names the outputs. |
+| `--out-xyz` | `<stem>_relaxed.xyz` | plain-XYZ of the final relaxed frame (PyMOL-friendly). |
+| `--out-pdb` | `<stem>_relax.pdb` | multi-state PDB of the whole relaxation (`mplay` in PyMOL). |
+| `--fmax` | `0.05` eV/Å | force convergence tolerance. |
+| `--steps` | `200` | max optimisation steps. |
+| `--smiles` | `<stem>.txt` | rod:/wheel: file to read optional `charge:`/`spin:` lines from. |
+
+### `displace_wheel.py` — shuttle scan + place the wheel at a side well
+
+| flag | default | description |
+|---|---|---|
+| `--input` | `<stem>_relaxed.xyz` | relaxed rotaxane; its stem names the outputs. |
+| `--smiles` | `<stem>.txt` | rod:/wheel: file for atom counts + charge/spin (must match `build`). |
+| `--out` | `<stem>_displaced.xyz` | placed-geometry XYZ (the MD start). |
+| `--side` | `farther` | which detected well to place at: `left`/`right` = furthest well on that side, `farther` = largest \|d\|, `deeper` = lowest energy. Falls back to the rigid wall if no wells. |
+| `--place-rigid` | off | force the legacy rigid stopper-wall placement (strained — relax with `optimize_uma.py` before MD). |
+| `--margin` | `0.3` Å | back-off from the stopper wall (rigid fallback / `--place-rigid` only). |
+| `--scan` / `--no-scan` | on | run / skip the relaxed shuttle scan (`--no-scan` forces `--place-rigid`). |
+| `--scan-chain` / `--no-scan-chain` | chain | chain-seeded two-sweep scan (default; threads past stoppers, maps every well on a side) vs the legacy rigid fresh-start scan (can't map past a stopper). |
+| `--scan-grid` | `0.25` Å | scan spacing (finer = better-resolved wells, slower). |
+| `--scan-fmax` | `0.05` eV/Å | per-station relax force tolerance. |
+| `--scan-steps` | `200` | max relax steps per station. |
+| `--production` | off | raise `--scan-steps` to a floor of 300 so threading-event stations converge (reporting-quality well depths; only the 1–3 hard points use the extra steps). |
+| `--scan-pad` | `4.0` Å | extend the rigid (`--no-scan-chain`) scan past each stopper; the chain scan ignores this and walks to the tip. |
+| `--scan-walk-emax` | `40` kcal/mol | stop a chain sweep when the energy rises more than this above the scan min (past the last well, into the tip wall). |
+| `--scan-walk-contact` | `1.2` Å | stop a chain sweep when the closest rod–wheel contact drops below this (a deep tip clash). |
+| `--scan-emax` | none | clip the plot (not the CSV) at min + this kcal/mol so a stray tip point doesn't flatten the landscape. |
+| `--rate-temp` | `300` K | temperature for the Eyring rate-estimate block. |
+| `--no-rates` | off | skip the Eyring rate-estimate block in the scan summary. |
+
+### `run_md.py` — UMA-driven MD
+
+| flag | default | description |
+|---|---|---|
+| `--input` | `<stem>_relaxed.xyz` | starting geometry; its stem names the outputs. Not re-relaxed — any valid XYZ with matching atom order works (e.g. a well from `displace_wheel.py`). |
+| `--smiles` | `<stem>.txt` | rod:/wheel: file for atom counts + charge/spin. |
+| `--out-xyz` | `<stem>_md.xyz` | plain-XYZ of the final frame. |
+| `--out-pdb` | `<stem>_md.pdb` | multi-state PDB trajectory. |
+| `--dt` | `0.5` fs | timestep. |
+| `--time` | `100` fs | total simulation length (short test default; scale up for real runs). |
+| `--thermostat` | `langevin` | `langevin` (NVT) or `nve` (Velocity-Verlet). |
+| `--temperature` | `300` K | temperature for velocity init / Langevin bath. |
+| `--friction` | `0.01` 1/fs | Langevin friction. |
+| `--stride` | `1` | store a trajectory frame every N steps. |
+| `--flush` | `100` | rewrite the PDB+XYZ every N steps so a killed/aborted run keeps its trajectory. |
+| `--seed` | `0xC0FFEE` | RNG seed for initial velocities. |
+
+### `plot_md.py` — plot MD observables
+
+| flag | default | description |
+|---|---|---|
+| `--pdb` | `<stem>_md.pdb` | multi-state PDB trajectory; its stem also sets `--log` and `--prefix` defaults. |
+| `--log` | `<stem>_md.log` | MD stdout log (parsed for T / E / wheel position). |
+| `--dt` | `1.0` fs | MD timestep (for the time axis). |
+| `--log-interval` | `10` | MD log lines per step. |
+| `--prefix` | `images/<stem>_md_` | output filename prefix. |
+| `--no-rmsd` | off | skip the RMSD plot (don't read the PDB). |
 
 ## Outputs
 
@@ -151,9 +227,9 @@ in `output_files/`; plots (`.png`) land in `images/`.
 | `output_files/<stem>_center.xyz` | build_rotaxane.py | assembled, sterics-optimised |
 | `output_files/<stem>_relaxed.xyz` | optimize_uma.py | UMA-relaxed final frame |
 | `output_files/<stem>_relax.pdb` | optimize_uma.py | relaxation trajectory |
-| `images/<stem>_scan.png` / `output_files/<stem>_scan.csv` | displace_wheel.py | relaxed UMA wheel energy vs position (stability scan) |
-| `output_files/<stem>_displaced.xyz` | displace_wheel.py | wheel slid to a steric extreme |
-| `output_files/<stem>_displaced_relaxed.xyz` | optimize_uma.py (on displaced) | UMA-relaxed displaced frame (strain-free MD start) |
+| `images/<stem>_scan.png` / `output_files/<stem>_scan.csv` | displace_wheel.py | relaxed UMA wheel energy vs position (kcal/mol, with global-min + well markers; CSV: displacement, energy eV, rel kcal/mol, min contact) |
+| `output_files/<stem>_displaced.xyz` | displace_wheel.py | wheel placed at a detected side well (scan-relaxed, MD-ready) |
+| `output_files/<stem>_displaced_relaxed.xyz` | optimize_uma.py (on `--place-rigid` displaced) | UMA-relaxed rigid displaced frame (only needed for the rigid placement) |
 | `output_files/<stem>_displaced_relax.pdb` | optimize_uma.py (on displaced) | displaced-structure relaxation trajectory |
 | `output_files/<stem>_md.xyz` | run_md.py | MD final frame |
 | `output_files/<stem>_md.pdb` | run_md.py | MD trajectory |
@@ -168,66 +244,81 @@ name collisions — just point the pipeline at its `.txt` and every stage derive
 its outputs from that file's stem:
 
 ```sh
-.venv/bin/python code/build_rotaxane.py --smiles rot_smiles2.txt   # -> output_files/rot_smiles2_center.xyz
-.venv/bin/python code/optimize_uma.py --input output_files/rot_smiles2_center.xyz
-.venv/bin/python code/displace_wheel.py --input output_files/rot_smiles2_relaxed.xyz
-.venv/bin/python code/run_md.py --input output_files/rot_smiles2_relaxed.xyz
+.venv/bin/python code/build_rotaxane.py --smiles rot2.txt          # -> output_files/rot2_center.xyz
+.venv/bin/python code/optimize_uma.py --input output_files/rot2_center.xyz
+.venv/bin/python code/displace_wheel.py --input output_files/rot2_relaxed.xyz --production
+.venv/bin/python code/run_md.py --input output_files/rot2_displaced.xyz
 ```
 
 ## Results: shuttle stability scan (relaxed UMA)
 
 Two systems, both using the 24-crown-8 wheel (56 atoms) with differing rods.
 For each, `build_rotaxane.py` assembles the rotaxane, `optimize_uma.py`
-relaxes it with UMA, then `displace_wheel.py` slides the wheel across the
-clash-free travel window on a 0.5 A grid and records a **relaxed UMA energy at
-each station**: the wheel is pinned along the rod axis and held rigid, the
-rod's two endpoint atoms are anchored, and the rod middle is free to flex away
-from the wheel under a loose convergence (fmax = 0.5 eV/A, 20 steps) -- just
-enough to relieve bad sterics, not a full minimisation. This gives a real
-shuttle landscape with minima and barriers as the wheel passes over the rod's
-phenyl/CF3 features, rather than a rigid single-point profile. All energies
-from UMA (`uma-s-1p1`, `omol`), CPU.
+relaxes it with UMA, then `displace_wheel.py` maps the shuttle landscape with a
+**chain-seeded relaxed scan**. Two monotonic outward sweeps leave the central
+relaxed minimum and step the wheel along the rod a quarter ångström at a time;
+each station is seeded from the previous relaxed geometry so the wheel threads
+through a stopper incrementally (a fresh rigid start past a stopper sits in
+deep overlap and does not converge on CPU). At each station the wheel is held
+rigid and the rod's two endpoint atoms are anchored, so the only free degrees of
+freedom are the rod's internal flex (phenyl/CF3 groups rotating away from the
+wheel) -- the scan coordinate stays fixed while bad sterics are relieved. Each
+sweep walks until it has mapped every well on its side and hits the rod-tip
+wall (energy or contact cutoff), so multiple wells on a long rod are captured.
+Energies are reported in **kcal/mol**; `detect_wells` then picks the local
+minima separated from the global minimum by a > 3 kcal/mol barrier (after
+smoothing rod-conformer noise and snapping each basin to its true raw
+minimum), and prints an Eyring TST rate estimate per well. All energies from
+UMA (`uma-s-1p1`, `omol`), CPU.
+
+> The landscape is on the wheel-rigid / rod-endpoint-anchored **constrained
+> surface**, so it includes some rod-conformer relaxation; well depths and
+> barriers are on that surface, not the free PES. The Eyring rates are
+> order-of-magnitude estimates (potential barriers treated as free-energy
+> barriers with the kBT/h prefactor) -- use them to rank wells and expose
+> asymmetry, not as absolute rates. Use `--production` for reporting-quality
+> well depths (it lets the hard threading-event stations converge).
+
+### Rotaxane 2 (`rot2.txt`) -- 114 atoms (rod 58 + wheel 56), rod 16.8 A
+
+Relaxation converges to E = -105801.09 eV, max|F| ≈ 0.05 eV/Å
+(`output_files/rot2_relaxed.xyz`). A `--production` chain scan (grid 0.25 Å,
+300-step floor, 55 points, `images/rot2_scan.png` /
+`output_files/rot2_scan.csv`) finds the global minimum at d = −1.50 Å and **two
+side wells** past the stoppers:
+
+- left well at d = −5.75 Å, E_rel = +9.57 kcal/mol, barrier = 18.8 kcal/mol;
+- right well at d = +3.50 Å, E_rel = +9.41 kcal/mol, barrier = 12.0 kcal/mol.
+
+Both sweeps stop at the tip walls (d = +6.50 and −7.00 Å, ≈ +55 kcal/mol), past
+the wells and before the deep tip. The Eyring rate estimates (300 K) make the
+asymmetry explicit: the right well empties to the centre in ~90 µs, the left
+well in ~8 s, while reaching a side well *from* the centre is far slower
+(centre→right ~10 min, centre→left ~years). So a wheel parked in the left well
+(the default `--side farther` placement, since |−5.75| > |+3.50|) is a
+long-lived metastable station and a good MD start; one in the right well would
+relax back to centre almost immediately.
+
+![Rotaxane 2 shuttle scan: relaxed UMA energy vs wheel position](images/rot2_scan.png)
 
 ### Rotaxane 1 (`rot_smiles.txt`) -- 144 atoms (rod 88 + wheel 56), rod 28.6 A
 
-Relaxation converges to E = -124662.29 eV, max|F| = 0.050 eV/A (84 steps,
-`output_files/rot_smiles_relaxed.xyz`). Scan travel: -left 10.35 A, +right 7.40 A (36
-points). The landscape is **multi-well** (`images/rot_smiles_scan.png` /
-`output_files/rot_smiles_scan.csv`):
-
-- global minimum at d ≈ 0 A (centred station, E_rel = 0) -- self-consistent
-  with the relaxed geometry;
-- left-stopper well at d = -9.85 A, E_rel ≈ +1.32 eV;
-- secondary +side well at d = +2.65 A, E_rel ≈ +1.13 eV;
-- sub-eV minima/barriers across the -5 to -2 A region as the wheel passes
-  over individual phenyl groups;
-- right-stopper wall rising to ~+3.9 eV by d = +6.15 A;
-- one narrow transient clash spike at d = -6.85 A, E_rel ≈ +9.69 eV (closest
-  contact 1.25 A) -- a single station where the wheel straddles a bulky
-  CF3/phenyl group the loose relaxation cannot fully relieve. It dominates the
-  printed accessible-window barrier (9.68 eV); the meaningful inter-well
-  barriers are ~1.1-1.3 eV. Pass `--scan-emax` (e.g. `--scan-emax 5`) to clip
-  just the display if the spike flattens the plot (the CSV keeps the true
-  values).
+Relaxation converges to E = -124662.29 eV, max|F| = 0.050 eV/Å (84 steps,
+`output_files/rot_smiles_relaxed.xyz`). The longer, feature-richer rod gives a
+**multi-well** landscape (`images/rot_smiles_scan.png` /
+`output_files/rot_smiles_scan.csv`): a centred global minimum plus wells near
+both stopper regions and sub-structure across the centre as the wheel passes
+over individual phenyl groups. (The detailed figures in the plot/CSV are from
+an earlier rigid-scan run; re-run `code/displace_wheel.py --input
+output_files/rot_smiles_relaxed.xyz --production` to regenerate them with the
+current chain scan and kcal/mol well depths + rate estimates.)
 
 ![Rotaxane 1 shuttle scan: relaxed UMA energy vs wheel position](images/rot_smiles_scan.png)
 
-### Rotaxane 2 (`rot_smiles2.txt`) -- 114 atoms (rod 58 + wheel 56), rod 16.8 A
-
-Relaxation converges to E = -105800.86 eV, max|F| = 0.058 eV/A (200 steps,
-`output_files/rot_smiles2_relaxed.xyz`). Scan travel: -left 3.50 A, +right 2.65 A (13
-points). The shorter rod gives a **single-well** landscape
-(`images/rot_smiles2_scan.png` / `output_files/rot_smiles2_scan.csv`): one central minimum at
-d = 0 A (E_rel = 0), with walls rising fairly smoothly to +1.83 eV at the left
-stopper (d = -3.50 A) and +1.19 eV at the right (d = +2.50 A);
-accessible-window barrier = 1.83 eV. No secondary minima -- the short rod has
-fewer bulky features to create them.
-
-The contrast between the two -- multi-well on the long, feature-rich rod vs
-single-well on the short, plain rod -- is exactly what the scan is meant to
-surface, and it tracks the rod length (28.6 A vs 16.8 A) and feature count.
-
-![Rotaxane 2 shuttle scan: relaxed UMA energy vs wheel position](images/rot_smiles2_scan.png)
+The contrast between the two -- rich multi-well landscape on the long rod vs a
+cleaner central-plus-two-side-well landscape on the short rod -- is exactly
+what the scan is meant to surface, and it tracks the rod length (28.6 Å vs
+16.8 Å) and feature count.
 
 ### Shuttle MD demo (legacy run)
 

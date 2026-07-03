@@ -66,27 +66,69 @@ complete these tasks and then output the combined molecule in xyz format for vis
      only accepts cpu/cuda -- Apple Silicon MPS is not supported). charge
      and spin are read from optional `charge:`/`spin:` lines in `<stem>.txt`,
      defaulting to 0 and 1.
-  3. `code/displace_wheel.py` (optional) -- slides the wheel along the rod's PCA
-     long axis. does two things: (a) a **relaxed stability-vs-position scan** --
-     the wheel is slid across the clash-free travel window on a grid; at each
-     station the wheel is pinned along the rod axis (FixedPlane) and the rod is
-     held rigid (FixAtoms) while UMA relaxes the wheel in the perpendicular
-     plane with a LOOSE convergence (just enough to relieve bad sterics, not a
-     full minimisation), then the relaxed energy is recorded. this gives a
-     finite shuttle landscape with real minima/barriers as the wheel passes over
-     the rod's phenyl/CF3 features. writes `images/<stem>_scan.png` (energy vs
-     displacement, relative to min, stopper walls and placed extreme marked) and
-     `output_files/<stem>_scan.csv`; and (b) places the wheel at a steric extreme for a more
-     interesting MD start -> `output_files/<stem>_displaced.xyz`. needs HF_TOKEN (UMA).
-     rod/wheel counts come from `<stem>.txt` via RDKit (must match build). a
-     stopper is detected as a *sustained* rod-wheel overlap (min distance < 1.0 A
-     over a 3 A width), not the transient dips from bumpy rod features passing
-     through the ring. CLI: `--side left|right|farther` (default farther),
-     `--margin`, `--input` (default `output_files/<stem>_relaxed.xyz`), `--out`,
-     `--scan-grid` (A, default 0.5), `--scan-pad` (A, default 0),
-     `--scan-fmax` (eV/A, default 0.5), `--scan-steps` (default 20),
-     `--scan-emax` (eV plot clip, default none), `--no-scan`. the rigid
-     displacement is strained, so relax it next:
+  3. `code/displace_wheel.py` -- maps the shuttle landscape and places the MD
+     start. does two things: (a) a **chain-seeded relaxed stability scan** -- two
+     monotonic outward sweeps from the central relaxed minimum, each station
+     seeded from the previous relaxed geometry so the wheel threads through a
+     stopper incrementally (a fresh rigid start past a stopper sits in deep
+     overlap and does not converge on CPU). each sweep walks until it has mapped
+     every well on its side and hits the rod-tip wall (energy/contact cutoff,
+     rod-length-aware), so multiple wells on a long rod are captured. at each
+     station the wheel is held RIGID (FixAtoms) at its station and the rod's two
+     endpoint atoms are anchored, so the only free DOF is the rod's internal
+     flex (phenyl/CF3 groups rotating away from the wheel) -- the scan coordinate
+     stays fixed while bad sterics are relieved; tight convergence
+     (`--scan-fmax 0.05`, `--scan-steps 200`). writes `images/<stem>_scan.png`
+     (energy vs displacement in kcal/mol, relative to the global min, with
+     global-min and well markers) and `output_files/<stem>_scan.csv` (4-col:
+     displacement_A, energy_UMA_eV, energy_rel_kcal_mol, min_contact_A). the
+     landscape is on the wheel-rigid / rod-endpoint-anchored constrained
+     surface, so it includes some rod-conformer relaxation; well depths/barriers
+     are on that surface, not the free PES. and (b) detects the scan's wells
+     (local minima separated from the global min by > BARRIER_MIN=3.0 kcal/mol,
+     after smoothing rod-conformer bumps; each basin is snapped to its deepest
+     converged raw point so the 1.25 A smoothing window doesn't shift the
+     reported minimum off the true floor; NOT-converged stations are interpolated
+     from converged neighbours and excluded from the global min) and writes the
+     chosen well's scan-relaxed geometry to `output_files/<stem>_displaced.xyz`.
+     well depths are grid-resolution-limited (0.25 A default vs the ~0.1 A that
+     resolves a ~0.6 A well) -- use `--scan-grid 0.1` for publication-quality
+     depths (slower). needs
+     HF_TOKEN (UMA). rod/wheel counts come from `<stem>.txt` via RDKit (must
+     match build). a stopper is detected as a *sustained* rod-wheel overlap (min
+     distance < 1.0 A over a 3 A width), not transient dips from bumpy rod
+     features; the search is rod-length-aware (bounded by the rod's extent, not
+     a fixed cap) and is used only for the advisory plot annotation and the
+     rigid fallback. CLI: `--side left|right|farther|deeper` (default farther =
+     largest |d| well; deeper = lowest-energy well), `--place-rigid` (force the
+     legacy rigid stopper-wall placement, which is strained and must be relaxed
+     next), `--input` (default `output_files/<stem>_relaxed.xyz`), `--out`,
+     `--scan-grid` (A, default 0.25), `--scan-fmax` (eV/A, default 0.05),
+     `--scan-steps` (default 200), `--production` (raise --scan-steps to a floor
+     of 300 so the hard threading-event stations converge instead of hitting the
+     step cap with an unreliable energy; for reporting-quality well depths --
+     only the 1-3 threading points use the extra steps, the rest converge <100),
+     `--scan-pad` (A, default 4.0; rigid scan only),
+     `--scan-walk-emax` (kcal/mol above min to stop a sweep, default 40),
+     `--scan-walk-contact` (A; stop when min_contact drops below, default 1.2),
+     `--scan-emax` (kcal/mol plot clip, default none), `--rate-temp` (K, default
+     300; temperature for the Eyring rate-estimate block), `--no-rates` (skip the
+     rate-estimate block), `--no-scan`,
+     `--no-scan-chain` (legacy rigid fresh-start scan; cannot map past a
+     stopper). the scan summary prints an Eyring TST rate estimate per well --
+     escape (well -> global min, over the well's barrier) and entry (global min
+     -> well, over the same saddle, = rel_kcal + barrier) as k and tau at
+     --rate-temp; ESTIMATE only (constrained-surface potential barriers treated
+     as free-energy barriers with the kBT/h prefactor; true rates need a
+     free-energy profile / Kramers friction). stations that hit the step cap
+     (NOT-converged, typically a wheel mid-threading) report an unreliable energy
+     and are excluded from well detection -- interpolated from converged
+     neighbours before smoothing, barred
+     from being a well/global-min, and the global min is taken over converged
+     stations only; the CSV/plot relative-energy scale uses that converged-only
+     min. the well geometry is already scan-relaxed and MD-ready, so the
+     displaced-relax step is now OPTIONAL -- `run_md.py` runs on it directly.
+     with `--place-rigid`, relax first:
      `code/optimize_uma.py --input output_files/<stem>_displaced.xyz` (auto-names
      `output_files/<stem>_displaced_relaxed.xyz` + `output_files/<stem>_displaced_relax.pdb`).
   4. `code/run_md.py` -- MD using UMA for forces. CLI: `--dt` (fs, default 0.5),
