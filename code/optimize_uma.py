@@ -25,12 +25,17 @@ import os
 import sys
 
 import numpy as np
-import torch
 from ase.io import read, write
 from ase.optimize import LBFGS
-from fairchem.core import pretrained_mlip, FAIRChemCalculator
+# NOTE: torch and fairchem.core are imported lazily inside make_calculator /
+# pick_device, NOT at module top. run_md.py and displace_wheel.py both
+# `from optimize_uma import ...`, so a module-level torch import would pull
+# torch (and its bundled libomp) into every process -- including tblite runs,
+# which would then segfault alongside tblite's own libomp (exit 139; the two
+# runtimes cannot coexist in one process). Keeping the import lazy means a
+# tblite run never loads torch at all, so the two never share a process.
 
-from rotaxane_paths import resolve_stem, out_path, default_smiles
+from rotaxane_paths import resolve_stem, out_path, default_smiles, ENGINES, DEFAULT_ENGINE
 
 # Defaults follow the stem-driven naming: a bare run relaxes
 # <stem>_center.xyz (stem from rot_smiles.txt) -> <stem>_relaxed.xyz +
@@ -58,6 +63,14 @@ def parse_args():
     p.add_argument("--smiles", default=None,
                    help="rod:/wheel: file to read optional charge/spin from "
                         "(default: <stem>.txt matching the input)")
+    p.add_argument("--engine", default=DEFAULT_ENGINE, choices=ENGINES,
+                   help="force source: 'uma' (Meta UMA MLIP, default; needs "
+                        "HF_TOKEN) or 'tblite' (GFN-xTB; no HF_TOKEN). A "
+                        "non-default engine tags outputs, e.g. "
+                        "<stem>_relaxed_tblite.xyz, so the engines coexist.")
+    p.add_argument("--method", default="GFN2-xTB",
+                   help="tblite method (default GFN2-xTB; also e.g. GFN1-xTB, "
+                        "GFN0-xTB, CEH). Ignored for --engine uma.")
     return p.parse_args()
 
 MODEL = "uma-s-1p1"          # UMA small checkpoint (auto-downloaded from HF)
@@ -71,9 +84,48 @@ def pick_device():
     """fairchem's MLIP predict unit only accepts 'cpu' or 'cuda' (it
     hard-asserts this; Apple Silicon MPS is not supported by the library).
     Prefer CUDA when available (e.g. on a Linux/GPU host), else CPU."""
+    import torch
     if torch.cuda.is_available():
         return "cuda"
     return "cpu"
+
+
+def make_calculator(engine, atoms, charge, spin, method="GFN2-xTB", device=None):
+    """Build and attach the ASE calculator for one force-source `engine`.
+
+    The engine's libraries are imported *inside* this function, in the branch
+    that uses them, so a single process only ever loads one engine's stack.
+    tblite and torch/fairchem each bundle their own libomp and segfault if used
+    together in one process (exit 139); this conditional import is the
+    structural guarantee they never co-load.
+
+    Returns ``(calc, device)`` -- `device` is None for tblite (no torch device).
+
+    engine == "uma" (default):
+        Meta UMA MLIP (uma-s-1p1, 'omol' task) via fairchem. Reads charge/spin
+        from `atoms.info` (set here), needs HF_TOKEN, and uses a torch device
+        (cuda if available else cpu; MPS is not supported by fairchem).
+    engine == "tblite":
+        GFN-xTB tight-binding (default GFN2-xTB) via the tblite ASE calculator.
+        charge/multiplicity are passed as constructor kwargs; no HF_TOKEN,
+        no torch. The vacuum box (set by the caller) is harmless for tblite.
+    """
+    if engine == "uma":
+        import torch
+        from fairchem.core import pretrained_mlip, FAIRChemCalculator
+        device = device or pick_device()
+        atoms.info["charge"] = charge
+        atoms.info["spin"] = spin
+        predictor = pretrained_mlip.get_predict_unit(MODEL, device=device)
+        calc = FAIRChemCalculator(predictor, task_name=TASK)
+        return calc, device
+    if engine == "tblite":
+        from tblite.ase import TBLite
+        # tblite reads total charge and spin multiplicity from constructor
+        # kwargs (it does not consult atoms.info the way FAIRChemCalculator does).
+        calc = TBLite(method=method, charge=charge, multiplicity=spin, verbosity=0)
+        return calc, None
+    raise ValueError(f"unknown engine {engine!r}; expected one of {ENGINES}")
 
 
 def read_charge_spin(path):
@@ -132,12 +184,14 @@ def np_max_force(atoms):
 def main():
     args = parse_args()
     # huggingface_hub reads HF_TOKEN automatically; we only check it is present
-    # so we can give a clear error before downloading the checkpoint.
-    get_hf_token()
+    # so we can give a clear error before downloading the checkpoint. tblite
+    # needs no token, so the check is UMA-only.
+    if args.engine == "uma":
+        get_hf_token()
 
     stem = resolve_stem(args.input)
-    out_xyz = args.out_xyz or out_path(stem, "relaxed", "xyz")
-    out_pdb = args.out_pdb or out_path(stem, "relax", "pdb")
+    out_xyz = args.out_xyz or out_path(stem, "relaxed", "xyz", engine=args.engine)
+    out_pdb = args.out_pdb or out_path(stem, "relax", "pdb", engine=args.engine)
     smiles_file = args.smiles or default_smiles(stem)
 
     atoms = read(args.input)
@@ -149,13 +203,19 @@ def main():
     atoms.info["charge"] = charge
     atoms.info["spin"] = spin
 
-    device = pick_device()
-    print(f"loaded {len(atoms)} atoms from {args.input}")
-    print(f"model={MODEL} task={TASK} device={device} charge={charge} spin={spin}")
-
-    predictor = pretrained_mlip.get_predict_unit(MODEL, device=device)
-    calc = FAIRChemCalculator(predictor, task_name=TASK)
+    # Build the calculator for the chosen engine. make_calculator imports the
+    # engine's libs inside the branch it uses, so only that engine loads.
+    calc, device = make_calculator(args.engine, atoms, charge, spin,
+                                   method=args.method)
     atoms.calc = calc
+
+    print(f"loaded {len(atoms)} atoms from {args.input}")
+    if args.engine == "uma":
+        print(f"engine=uma model={MODEL} task={TASK} device={device} "
+              f"charge={charge} spin={spin}")
+    else:
+        print(f"engine=tblite method={args.method} charge={charge} spin={spin} "
+              f"(no torch device)")
 
     e0 = atoms.get_potential_energy()
     f0 = np_max_force(atoms)
@@ -179,8 +239,9 @@ def main():
           f"(steps={opt.get_number_of_steps()})")
 
     # Plain XYZ of the final relaxed frame (centered).
+    eng_label = "UMA" if args.engine == "uma" else f"{args.method} (tblite)"
     write_plain_xyz(out_xyz, centered_copy(atoms),
-                    comment=f"rotaxane UMA-relaxed  E={e1:.6f} eV  "
+                    comment=f"rotaxane {eng_label}-relaxed  E={e1:.6f} eV  "
                             f"max|F|={f1:.4f} eV/A  "
                             f"input={os.path.basename(args.input)}")
     # Multi-state PDB of the whole relaxation (each frame centered).

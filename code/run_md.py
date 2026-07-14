@@ -24,7 +24,11 @@ from ase.md.velocitydistribution import (
     Stationary,
     ZeroRotation,
 )
-from fairchem.core import pretrained_mlip, FAIRChemCalculator
+# NOTE: fairchem/torch is NOT imported at module top. run_md imports helpers
+# from optimize_uma, whose own module top is engine-agnostic; the engine's
+# libs load only inside make_calculator (see the tblite-libomp segfault note in
+# optimize_uma.py). A top-level fairchem import here would pull torch into every
+# process including tblite runs, defeating that isolation.
 
 from optimize_uma import (
     MODEL,
@@ -32,13 +36,19 @@ from optimize_uma import (
     VACUUM,
     centered_copy,
     get_hf_token,
+    make_calculator,
     np_max_force,
-    pick_device,
     read_charge_spin,
     write_plain_xyz,
 )
 from displace_wheel import fragment_counts, rod_axis
-from rotaxane_paths import resolve_stem, out_path, default_smiles
+from rotaxane_paths import (
+    resolve_stem,
+    out_path,
+    default_smiles,
+    ENGINES,
+    DEFAULT_ENGINE,
+)
 
 DEFAULT_IN = out_path("rot_smiles", "relaxed", "xyz")
 
@@ -75,6 +85,13 @@ def parse_args():
     p.add_argument("--smiles", default=None,
                    help="rod:/wheel: file for atom counts + charge/spin "
                         "(default: <stem>.txt matching the input)")
+    p.add_argument("--engine", default=DEFAULT_ENGINE, choices=ENGINES,
+                   help="force source: 'uma' (Meta UMA MLIP, default; needs "
+                        "HF_TOKEN) or 'tblite' (GFN-xTB; no HF_TOKEN). A "
+                        "non-default engine tags outputs, e.g. "
+                        "<stem>_md_tblite.xyz, so the engines coexist.")
+    p.add_argument("--method", default="GFN2-xTB",
+                   help="tblite method (default GFN2-xTB). Ignored for --engine uma.")
     return p.parse_args()
 
 
@@ -103,11 +120,13 @@ def wheel_offset_along_rod(atoms, rod_n, ref_axis):
 
 def main():
     args = parse_args()
-    get_hf_token()
+    # tblite needs no HF_TOKEN; only gate UMA (which downloads the checkpoint).
+    if args.engine == "uma":
+        get_hf_token()
 
     stem = resolve_stem(args.input)
-    out_xyz = args.out_xyz or out_path(stem, "md", "xyz")
-    out_pdb = args.out_pdb or out_path(stem, "md", "pdb")
+    out_xyz = args.out_xyz or out_path(stem, "md", "xyz", engine=args.engine)
+    out_pdb = args.out_pdb or out_path(stem, "md", "pdb", engine=args.engine)
     smiles_path = args.smiles or default_smiles(stem)
 
     atoms = read(args.input)
@@ -117,13 +136,17 @@ def main():
     atoms.info["charge"] = charge
     atoms.info["spin"] = spin
 
-    device = pick_device()
-    print(f"loaded {len(atoms)} atoms from {args.input}")
-    print(f"model={MODEL} task={TASK} device={device} charge={charge} spin={spin}")
-
-    predictor = pretrained_mlip.get_predict_unit(MODEL, device=device)
-    calc = FAIRChemCalculator(predictor, task_name=TASK)
+    calc, device = make_calculator(args.engine, atoms, charge, spin,
+                                   method=args.method)
     atoms.calc = calc
+
+    print(f"loaded {len(atoms)} atoms from {args.input}")
+    if args.engine == "uma":
+        print(f"engine=uma model={MODEL} task={TASK} device={device} "
+              f"charge={charge} spin={spin}")
+    else:
+        print(f"engine=tblite method={args.method} charge={charge} spin={spin} "
+              f"(no torch device)")
 
     # Initial velocities at T, then remove center-of-mass drift and rotation.
     rng = np.random.default_rng(args.seed)

@@ -48,7 +48,10 @@ from ase.io import read
 from rdkit import Chem
 
 from build_rotaxane import read_smiles
-from rotaxane_paths import resolve_stem, out_path, default_smiles
+from rotaxane_paths import (
+    resolve_stem, out_path, default_smiles, OUTPUT_DIR,
+    ENGINES, DEFAULT_ENGINE, engine_tag,
+)
 
 DEFAULT_IN = out_path("rot_smiles", "relaxed", "xyz")
 
@@ -87,6 +90,31 @@ WALK_CONTACT = 1.2  # A -- stop a sweep when min_contact drops below this
 BARRIER_MIN = 3.0  # kcal/mol -- a local minimum counts as a well only if it is
                    # separated from the global min by a barrier taller than this
                    # (filters rod-conformer noise bumps that aren't real wells)
+SMOOTH_PTS = 5    # moving-average window in POINTS (not A) for well detection.
+                   # A point-count window keeps the smoothing width proportional to
+                   # the grid: ~1.25 A at the 0.25 default (unchanged behaviour),
+                   # shrinking to 0.5 A at 0.1 -- narrow enough to resolve the
+                   # ~0.4-A stopper wells that an A-fixed 1.25 A window smears into
+                   # the monotonic flank. (An A-fixed window grows in point count as
+                   # the grid refines, so finer grids detect stopper wells WORSE,
+                   # not better.) Depth is still taken from the raw snapped floor,
+                   # so narrowing the window only affects detection, not depth.
+
+# Symmetric (mirror-seeded) chain scan. Both rods are end-to-end chemically
+# symmetric (verified via RDKit symmetry-equivalent atom ranks), so the two-
+# sweep scan's lopsided landscape (e.g. rot2: barriers 18.8 vs 12.0 kcal/mol on
+# mirror sides) is a hysteresis artifact -- each sweep relaxes the rod into a
+# different, non-mirror conformer. The symmetric scan builds the -u side as the
+# mirror of the +u side so the two agree by construction. A rod conformer pre-
+# search avoids the fixed-seed single-embed bias in build_rotaxane (seed
+# 0xC0FFEE) that could otherwise seed the d=0 minimum in a bad local-min conformer.
+ROD_CONFORMERS = 10   # number of RDKit rod conformers to generate + MMFF-rank for
+                      # the symmetric d=0 seed (0 = use the input rod as-is).
+SYM_TOL = 0.5         # kcal/mol -- |E(+d) - E(-d)| above this re-relaxes the
+                      # higher side seeded from the mirror of the lower one.
+SYM_ITERS = 3         # max passes of the symmetry agreement loop (rarely fires --
+                      # the mirror seed is already a stationary point of the -d
+                      # constrained problem, so it relaxes in ~0 steps).
 
 EV_TO_KCAL_MOL = 23.0605  # 1 eV = 23.0605 kcal/mol (96.485 kJ/mol). UMA returns
                           # eV; scan outputs (CSV + plot + summary) report
@@ -113,6 +141,61 @@ def min_distance(rod_pos, wheel_pos):
     """Closest rod-wheel atom-atom distance (A)."""
     diff = rod_pos[:, None, :] - wheel_pos[None, :, :]
     return float(np.sqrt((diff ** 2).sum(axis=-1)).min())
+
+
+def mirror_through_rod_center(pos, u, rod_center):
+    """Reflect every atom through the plane perpendicular to `u` at `rod_center`.
+
+    Symmetry-equivalent rod atoms share the same element (verified via RDKit
+    symmetry-equivalent atom ranks), so reflecting the rod WITHOUT permuting atom
+    labels still puts the correct element at every position -- the UMA energy is
+    unchanged. The rod/wheel split (first rod_n atoms) is preserved, and the
+    FixAtoms tip-anchors are recomputed downstream by argmin/argmax of the
+    projection, so they stay correct. The wheel (crown ether) is achiral and
+    symmetric, so reflecting it is a valid rigid motion. Thus the mirror of a +d
+    relaxed geometry is a stationary point of the -d constrained problem.
+    """
+    return pos - 2.0 * np.outer((pos - rod_center) @ u, u)
+
+
+def best_rod_conformer(rod_smi, n_conformers):
+    """Lowest-MMFF-energy RDKit conformer of the rod, or None to use the input rod.
+
+    build_rotaxane embeds the rod with a fixed seed (0xC0FFEE), so a single local-
+    min conformer can bias the scan. Generate `n_conformers` ETKDGv3 conformers
+    (varied seed per index), MMFF-optimize each (UFF fallback, mirroring
+    build_rotaxane.mol_to_xyz_block), and return the lowest-energy one's positions
+    + elements. The rod backbones are rigid aromatic phenylenes, so the MMFF
+    minimum stays extended (the conformer spread is mainly stopper phenyl
+    rotations). n_conformers == 0 returns None (caller uses the input rod as-is).
+    """
+    if n_conformers <= 0:
+        return None
+    from rdkit import Chem
+    from rdkit.Chem import AllChem
+    mol = Chem.AddHs(Chem.MolFromSmiles(rod_smi))
+    params = AllChem.ETKDGv3()
+    params.randomSeed = 0xC0FFEE
+    conf_ids = AllChem.EmbedMultipleConfs(mol, numConfs=n_conformers,
+                                          params=params)
+    if not conf_ids:
+        raise RuntimeError("RDKit rod embedding failed for conformer pre-search")
+    best_e, best_pos, best_elems = None, None, None
+    for cid in conf_ids:
+        try:
+            AllChem.MMFFOptimizeMolecule(mol, confId=cid)
+            ff = AllChem.MMFFGetMoleculeForceField(mol, confId=cid)
+            e = float(ff.CalcEnergy())
+        except Exception:
+            AllChem.UFFOptimizeMolecule(mol, confId=cid)
+            e = float(AllChem.UFFGetMoleculeForceField(mol, confId=cid).CalcEnergy())
+        if best_e is None or e < best_e:
+            best_e = e
+            best_pos = np.array(mol.GetConformer(cid).GetPositions(), dtype=float)
+            best_elems = [a.GetSymbol() for a in mol.GetAtoms()]
+    print(f"rod conformer pre-search: {len(conf_ids)} MMFF conformers, "
+          f"lowest energy {best_e:.3f} kcal/mol selected", flush=True)
+    return best_elems, best_pos
 
 
 def sustained_wall(rod_pos, wheel_pos, direction, d0):
@@ -158,11 +241,12 @@ def write_plain_xyz(path, symbols, pos, comment=""):
 # Stability-vs-position scan (relaxed UMA per wheel position)
 # --------------------------------------------------------------------------- #
 def run_scan(symbols, pos0, rod_n, u, left, right, smiles_path,
-             grid=SCAN_GRID, pad=SCAN_PAD, fmax=SCAN_FMAX, steps=SCAN_STEPS):
-    """Relaxed UMA scan of the wheel along the rod.
+             grid=SCAN_GRID, pad=SCAN_PAD, fmax=SCAN_FMAX, steps=SCAN_STEPS,
+             engine=DEFAULT_ENGINE, method="GFN2-xTB"):
+    """Relaxed scan of the wheel along the rod (`engine` is the force source).
 
     At each grid point the wheel is placed rigidly at `wheel0 + u*d` (station d
-    along the rod), then UMA relaxes the structure with:
+    along the rod), then the engine relaxes the structure with:
       - the wheel held RIGID and fixed at station d (FixAtoms), so it stays
         mechanically threaded on the rod and cannot pop off sideways, and
       - the rod's two endpoint atoms anchored (FixAtoms), so the rod can flex
@@ -175,7 +259,7 @@ def run_scan(symbols, pos0, rod_n, u, left, right, smiles_path,
 
     Returns (ds, energies, min_contacts, pos_by_d, converged). `ds` are signed
     displacements along `u` (positive = +u direction); `energies` are the relaxed
-    UMA potential energies (eV); `min_contacts` are the closest rod-wheel
+    potential energies (eV); `min_contacts` are the closest rod-wheel
     distances at the *relaxed* geometry; `pos_by_d` is None (the rigid path keeps
     no per-station geometry); `converged` is a bool array (False = hit the step
     cap, an unreliable energy to exclude from well detection).
@@ -184,23 +268,27 @@ def run_scan(symbols, pos0, rod_n, u, left, right, smiles_path,
     from ase.constraints import FixAtoms
     from ase.optimize import LBFGS
     from optimize_uma import (
-        MODEL, TASK, VACUUM, get_hf_token, pick_device, read_charge_spin,
+        MODEL, TASK, VACUUM, get_hf_token, make_calculator, read_charge_spin,
     )
-    from fairchem.core import pretrained_mlip, FAIRChemCalculator
 
-    get_hf_token()
+    if engine == "uma":
+        get_hf_token()
     charge, spin = read_charge_spin(smiles_path)
-    device = pick_device()
-    print(f"scan: UMA relaxed  model={MODEL} task={TASK} device={device} "
-          f"charge={charge} spin={spin}  fmax={fmax} eV/A  steps={steps}")
 
     atoms = Atoms(symbols=symbols, positions=np.asarray(pos0, dtype=float))
     atoms.set_pbc(False)
     atoms.center(vacuum=VACUUM)  # large non-periodic box; translation-invariant
     atoms.info["charge"] = charge
     atoms.info["spin"] = spin
-    predictor = pretrained_mlip.get_predict_unit(MODEL, device=device)
-    atoms.calc = FAIRChemCalculator(predictor, task_name=TASK)
+    calc, device = make_calculator(engine, atoms, charge, spin, method=method)
+    atoms.calc = calc
+
+    if engine == "uma":
+        print(f"scan: UMA relaxed  model={MODEL} task={TASK} device={device} "
+              f"charge={charge} spin={spin}  fmax={fmax} eV/A  steps={steps}")
+    else:
+        print(f"scan: tblite relaxed  method={method} charge={charge} spin={spin} "
+              f"fmax={fmax} eV/A  steps={steps}")
 
     # Work in the centered frame. Translation doesn't change `u` or the rod/wheel
     # relative geometry, so the displacement grid is unchanged.
@@ -255,20 +343,22 @@ def run_scan(symbols, pos0, rod_n, u, left, right, smiles_path,
 # --------------------------------------------------------------------------- #
 def run_scan_chain(symbols, pos0, rod_n, u, smiles_path,
                    grid=SCAN_GRID, fmax=SCAN_FMAX, steps=SCAN_STEPS,
-                   walk_emax=WALK_EMAX, walk_contact=WALK_CONTACT):
-    """Relaxed UMA scan as two outward sweeps from the central minimum, each
-    walking until it has mapped every well on its side and hits the rod tip wall.
+                   walk_emax=WALK_EMAX, walk_contact=WALK_CONTACT,
+                   engine=DEFAULT_ENGINE, method="GFN2-xTB"):
+    """Relaxed scan (`engine` force source) as two outward sweeps from the
+    central minimum, each walking until it has mapped every well on its side and
+    hits the rod tip wall.
 
     Both sweeps start from the input relaxed geometry (the d=0 seed) and step the
     wheel outward along the rod axis by `grid` at a time. Every station is seeded
     from the previous point's relaxed geometry -- the wheel is nudged rigidly
-    one grid step along u, the rod is carried forward -- then UMA-relaxes with
-    the wheel held rigid (FixAtoms) and the rod's two endpoint atoms anchored
-    (so the rod can flex internally to relieve sterics but cannot translate or
-    escape). Seeding from the prior relaxed structure lets the wheel thread
-    through a stopper incrementally so each point converges in a few steps; a
-    fresh rigid start past a stopper sits in deep overlap and does not converge
-    on CPU (run_scan).
+    one grid step along u, the rod is carried forward -- then the engine relaxes
+    with the wheel held rigid (FixAtoms) and the rod's two endpoint atoms
+    anchored (so the rod can flex internally to relieve sterics but cannot
+    translate or escape). Seeding from the prior relaxed structure lets the
+    wheel thread through a stopper incrementally so each point converges in a
+    few steps; a fresh rigid start past a stopper sits in deep overlap and does
+    not converge on CPU (run_scan).
 
     Each sweep stops once it is past the last well and into the tip wall:
       - the relaxed energy rises more than `walk_emax` (kcal/mol) above the
@@ -282,7 +372,7 @@ def run_scan_chain(symbols, pos0, rod_n, u, smiles_path,
 
     Returns (ds, energies, contacts, pos_by_d, converged) sorted by signed
     displacement d along u (d=0 is the input relaxed geometry). energies are
-    relaxed UMA potential energies (eV); contacts are the closest rod-wheel
+    relaxed potential energies (eV); contacts are the closest rod-wheel
     distances at the relaxed geometry; pos_by_d maps each d to its relaxed
     positions (np.array, same atom order as the input) so a well's geometry can
     be written out as an MD start without re-relaxing; converged is a bool array
@@ -292,25 +382,31 @@ def run_scan_chain(symbols, pos0, rod_n, u, smiles_path,
     from ase.constraints import FixAtoms
     from ase.optimize import LBFGS
     from optimize_uma import (
-        MODEL, TASK, VACUUM, get_hf_token, pick_device, read_charge_spin,
+        MODEL, TASK, VACUUM, get_hf_token, make_calculator, read_charge_spin,
     )
-    from fairchem.core import pretrained_mlip, FAIRChemCalculator
 
-    get_hf_token()
+    if engine == "uma":
+        get_hf_token()
     charge, spin = read_charge_spin(smiles_path)
-    device = pick_device()
-    print(f"scan(chain): UMA relaxed  model={MODEL} task={TASK} device={device} "
-          f"charge={charge} spin={spin}  fmax={fmax} eV/A  steps={steps}  "
-          f"grid={grid} A  walk_emax={walk_emax} kcal/mol  "
-          f"walk_contact={walk_contact} A  (two sweeps from d=0)", flush=True)
 
     atoms = Atoms(symbols=symbols, positions=np.asarray(pos0, dtype=float))
     atoms.set_pbc(False)
     atoms.center(vacuum=VACUUM)  # large non-periodic box; translation-invariant
     atoms.info["charge"] = charge
     atoms.info["spin"] = spin
-    predictor = pretrained_mlip.get_predict_unit(MODEL, device=device)
-    atoms.calc = FAIRChemCalculator(predictor, task_name=TASK)
+    calc, device = make_calculator(engine, atoms, charge, spin, method=method)
+    atoms.calc = calc
+
+    if engine == "uma":
+        print(f"scan(chain): UMA relaxed  model={MODEL} task={TASK} device={device} "
+              f"charge={charge} spin={spin}  fmax={fmax} eV/A  steps={steps}  "
+              f"grid={grid} A  walk_emax={walk_emax} kcal/mol  "
+              f"walk_contact={walk_contact} A  (two sweeps from d=0)", flush=True)
+    else:
+        print(f"scan(chain): tblite relaxed  method={method} charge={charge} "
+              f"spin={spin}  fmax={fmax} eV/A  steps={steps}  grid={grid} A  "
+              f"walk_emax={walk_emax} kcal/mol  walk_contact={walk_contact} A  "
+              f"(two sweeps from d=0)", flush=True)
 
     centered = atoms.get_positions()
     rod_pos = centered[:rod_n]
@@ -382,18 +478,280 @@ def run_scan_chain(symbols, pos0, rod_n, u, smiles_path,
     return ds, energies, contacts, pos_by_d, converged
 
 
-def detect_wells(ds, energies, grid, pos_by_d, converged=None):
+def rotation_align(a, b):
+    """Rotation matrix mapping unit vector `a` onto unit vector `b` (Rodrigues)."""
+    a = a / np.linalg.norm(a)
+    b = b / np.linalg.norm(b)
+    c = float(a @ b)
+    if c > 1.0 - 1e-12:
+        return np.eye(3)
+    if c < -1.0 + 1e-12:
+        # 180-degree flip about any axis perpendicular to a
+        n = np.array([1.0, 0.0, 0.0]) if abs(a[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+        a = a - (a @ n) * n
+        a /= np.linalg.norm(a)
+        c = float(a @ b)
+    v = np.cross(a, b)
+    s = float(np.linalg.norm(v))
+    kx = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
+    return np.eye(3) + kx + (kx @ kx) * ((1 - c) / (s * s))
+
+
+# --------------------------------------------------------------------------- #
+# Symmetric (mirror-seeded) chain scan: build the -u side as the mirror of +u
+# --------------------------------------------------------------------------- #
+def run_scan_chain_sym(symbols, pos0, rod_n, u, smiles_path,
+                       grid=SCAN_GRID, fmax=SCAN_FMAX, steps=SCAN_STEPS,
+                       walk_emax=WALK_EMAX, walk_contact=WALK_CONTACT,
+                       rod_conformers=ROD_CONFORMERS, sym_tol=SYM_TOL,
+                       sym_iters=SYM_ITERS,
+                       engine=DEFAULT_ENGINE, method="GFN2-xTB"):
+    """Relaxed scan (`engine` force source) whose landscape is mirror-symmetric
+    about d=0 by construction -- the fix for the two-sweep scan's hysteresis
+    asymmetry.
+
+    Both rods are end-to-end chemically symmetric (verified via RDKit symmetry-
+    equivalent atom ranks), so the two-sweep scan's lopsided landscape (e.g. rot2:
+    barriers 18.8 vs 12.0 kcal/mol on mirror sides) is an artifact of each sweep
+    relaxing the rod into a different, non-mirror conformer. Here only the +u side
+    is swept (chain-seeded, threading the stopper incrementally as in
+    run_scan_chain); the -u side is built by *mirroring* each +d relaxed geometry
+    through the rod-center plane (mirror_through_rod_center) and re-relaxing. The
+    mirror of a +d geometry is a stationary point of the -d constrained problem
+    (symmetry-equivalent atoms share an element, so reflection preserves the
+    energy; the wheel is achiral/symmetric; the FixAtoms tip-anchors are
+    recomputed by argmin/argmax), so it relaxes in ~0 steps and E(-d) = E(+d) to
+    optimizer tolerance -- no atom permutation is needed.
+
+    A rod conformer pre-search (best_rod_conformer) replaces the fixed-seed single
+    embed from build_rotaxane with the lowest-MMFF-energy of N RDKit conformers,
+    aligned to the input frame (long axis -> u, centered at the rod center), then
+    engine-optimized (a free rod relaxation with the wheel held rigid at center) so
+    the stopper phenyls reach a proper engine minimum. A raw MMFF conformer used
+    as-is lands in a local minimum whose stopper orientation blocks threading; the
+    free pre-relax makes the conformer-derived rod comparable to the already-
+    relaxed input rod.
+
+    An agreement loop (sym_tol, sym_iters) re-relaxes the higher-energy side of any
+    |d| pair seeded from the mirror of the lower side, until |E(+d) - E(-d)| <
+    sym_tol -- the user's "re-optimize the lower side until they agree". Rarely
+    fires (the mirror seed is already a stationary point); it is the safety net
+    for noisy/NOT-converged stations.
+
+    d=0 is the rod center (wheel centered on the rod), so a symmetric rod's global
+    minimum lands at d=0. Returns the same (ds, energies, contacts, pos_by_d,
+    converged) tuple as run_scan_chain for drop-in use by detect_wells/plot/csv.
+    """
+    from ase import Atoms
+    from ase.constraints import FixAtoms
+    from ase.optimize import LBFGS
+    from optimize_uma import (
+        MODEL, TASK, VACUUM, get_hf_token, make_calculator, read_charge_spin,
+    )
+
+    if engine == "uma":
+        get_hf_token()
+    charge, spin = read_charge_spin(smiles_path)
+
+    atoms = Atoms(symbols=symbols, positions=np.asarray(pos0, dtype=float))
+    atoms.set_pbc(False)
+    atoms.center(vacuum=VACUUM)
+    atoms.info["charge"] = charge
+    atoms.info["spin"] = spin
+    calc, device = make_calculator(engine, atoms, charge, spin, method=method)
+    atoms.calc = calc
+
+    if engine == "uma":
+        print(f"scan(symmetric): UMA relaxed  model={MODEL} task={TASK} "
+              f"device={device} charge={charge} spin={spin}  fmax={fmax} eV/A  "
+              f"steps={steps}  grid={grid} A  walk_emax={walk_emax} kcal/mol  "
+              f"walk_contact={walk_contact} A  rod_conformers={rod_conformers}  "
+              f"sym_tol={sym_tol} kcal/mol  sym_iters={sym_iters}  "
+              f"(+u swept, -u mirrored)", flush=True)
+    else:
+        print(f"scan(symmetric): tblite relaxed  method={method} charge={charge} "
+              f"spin={spin}  fmax={fmax} eV/A  steps={steps}  grid={grid} A  "
+              f"walk_emax={walk_emax} kcal/mol  walk_contact={walk_contact} A  "
+              f"rod_conformers={rod_conformers}  sym_tol={sym_tol} kcal/mol  "
+              f"sym_iters={sym_iters}  (+u swept, -u mirrored)", flush=True)
+
+    centered = atoms.get_positions()
+    rod_pos = centered[:rod_n].copy()
+    wheel0 = centered[rod_n:]
+    wheel_idx = list(range(rod_n, len(symbols)))
+    rod_center = rod_pos.mean(axis=0)
+
+    # Optional rod conformer pre-search: lowest-MMFF RDKit conformer, aligned to
+    # the input frame (long axis -> u, centered at the rod center), then UMA-
+    # optimized (free rod relaxation with the wheel held rigid at center) so the
+    # stopper phenyls reach a proper UMA minimum. A raw MMFF conformer used as-is
+    # lands in a local UMA minimum whose stopper orientation blocks threading; the
+    # free pre-relax makes the conformer-derived rod comparable to the (already
+    # UMA-relaxed) input rod. The conformer is in SMILES atom order, matching the
+    # input rod, so the rod/wheel split and atom order are unchanged.
+    if rod_conformers > 0:
+        rod_smi, _ = read_smiles(smiles_path)
+        elems, rconf = best_rod_conformer(rod_smi, rod_conformers)
+        if elems != list(symbols[:rod_n]):
+            raise RuntimeError(
+                "rod conformer element order does not match the input geometry")
+        v = rod_axis(rconf)
+        rconf = (rotation_align(v, u) @ rconf.T).T
+        rconf = rconf - rconf.mean(axis=0) + rod_center
+        # UMA-optimize the conformer: place it with the wheel centered, hold the
+        # wheel rigid, and let the whole rod relax freely (no tip anchors) so the
+        # stoppers find a proper UMA minimum. The centered wheel + symmetric rod
+        # give zero net force on the rod, so rod_center stays put.
+        pre_pos = centered.copy()
+        pre_pos[:rod_n] = rconf
+        pre_pos[rod_n:] = wheel0 - wheel0.mean(axis=0) + rod_center
+        atoms.set_constraint()
+        atoms.set_positions(pre_pos)
+        atoms.set_constraint([FixAtoms(wheel_idx)])
+        pre_opt = LBFGS(atoms, logfile=None)
+        pre_opt.run(fmax=fmax, steps=steps)
+        rod_pos = atoms.get_positions()[:rod_n].copy()
+        rod_center = rod_pos.mean(axis=0)   # symmetry plane (recomputed; ~unchanged)
+        _eng_lbl = "UMA" if engine == "uma" else "tblite"
+        print(f"  conformer {_eng_lbl} pre-relax: {pre_opt.get_number_of_steps()} "
+              f"steps  E={atoms.get_potential_energy():.4f} eV  "
+              f"{'converged' if pre_opt.converged() else 'NOT-converged'}", flush=True)
+
+    proj = rod_pos @ u
+    anchors = [int(np.argmin(proj)), int(np.argmax(proj))]
+    fixed_idx = wheel_idx + anchors
+    # The symmetry plane is fixed at the rod center for the whole scan (the rod
+    # flexes, but the symmetry element does not move). caps are rod-length-aware;
+    # for a symmetric rod centered at rod_center, cap_left == cap_right, so
+    # mirroring the +u sweep maps the whole -u side.
+    wheel_c = float(rod_center @ u)
+    cap_right = min(ABS_MAX_SLIDE, float(proj.max()) - wheel_c + 1.0)
+
+    def relax_at(positions, d):
+        atoms.set_constraint()           # clear before repositioning (see run_scan)
+        atoms.set_positions(positions)
+        atoms.set_constraint([FixAtoms(fixed_idx)])
+        opt = LBFGS(atoms, logfile=None)
+        opt.run(fmax=fmax, steps=steps)
+        relaxed = atoms.get_positions()
+        e = float(atoms.get_potential_energy())
+        c = min_distance(relaxed[:rod_n], relaxed[rod_n:])
+        wc_u = float((relaxed[rod_n:].mean(axis=0) - relaxed[:rod_n].mean(axis=0)) @ u)
+        flag = "converged" if opt.converged() else "NOT-converged"
+        print(f"  scan d={d:+.2f} A  E={e:.4f} eV  min_contact={c:.2f} A  "
+              f"wheel_u={wc_u:+.2f} A  relax_steps={opt.get_number_of_steps()}  "
+              f"{flag}", flush=True)
+        return relaxed, e, c, bool(opt.converged())
+
+    # d=0 seed: wheel centered on the rod (the symmetry origin), rod as prepared
+    # (input rod, or the best conformer). Relaxed under the wheel-rigid /
+    # rod-tip-anchored constraints. d=0 is its own mirror, so the landscape is
+    # symmetric about it regardless of this conformer's exact shape; the conformer
+    # pre-search just makes it a fresh low-strain near-symmetric seed.
+    seed_pos = centered.copy()
+    seed_pos[:rod_n] = rod_pos
+    seed_pos[rod_n:] = wheel0 - wheel0.mean(axis=0) + rod_center
+    seed, e0, c0, conv0 = relax_at(seed_pos, 0.0)
+    pos_by_d = {0.0: seed.copy()}
+    e_by_d = {0.0: e0}
+    c_by_d = {0.0: c0}
+    conv_by_d = {0.0: conv0}
+    emin = e0  # running global min; the +u walk cutoff is measured above this
+
+    # +u chain sweep (only one side is swept -- the other is mirrored).
+    state = seed.copy()
+    k = 1
+    while k * grid <= cap_right:
+        d = k * grid
+        pos = state.copy()
+        pos[rod_n:] = state[rod_n:] + u * grid       # nudge wheel one +grid step
+        relaxed, e, c, conv = relax_at(pos, d)
+        pos_by_d[d] = relaxed.copy()
+        e_by_d[d] = e
+        c_by_d[d] = c
+        conv_by_d[d] = conv
+        state = relaxed
+        emin = min(emin, e)
+        if (e - emin) * EV_TO_KCAL_MOL > walk_emax or c < walk_contact:
+            print(f"  sweep +u stops at d={d:+.2f} A  "
+                  f"(E_rel={(e - emin) * EV_TO_KCAL_MOL:.1f} kcal/mol, "
+                  f"min_contact={c:.2f} A)", flush=True)
+            break
+        k += 1
+
+    # -u side: mirror each +d relaxed geometry through the rod-center plane and
+    # relax under the -d constraints. The mirror is a stationary point of the -d
+    # problem, so this converges in ~0 steps and gives E(-d) = E(+d).
+    pos_ds = sorted(d for d in pos_by_d if d > 0.0)
+    for d in pos_ds:
+        m = mirror_through_rod_center(pos_by_d[d], u, rod_center)
+        relaxed, e, c, conv = relax_at(m, -d)
+        pos_by_d[-d] = relaxed.copy()
+        e_by_d[-d] = e
+        c_by_d[-d] = c
+        conv_by_d[-d] = conv
+
+    # Agreement loop: for any |d| pair disagreeing by > sym_tol, re-relax the
+    # higher side seeded from the mirror of the lower side. (Rarely fires -- the
+    # mirror seed is already a stationary point; this is the safety net for noisy
+    # / NOT-converged stations.)
+    for _ in range(sym_iters):
+        worst_d, worst_gap = None, 0.0
+        for d in pos_ds:
+            gap = abs(e_by_d[d] - e_by_d[-d]) * EV_TO_KCAL_MOL
+            if gap > worst_gap:
+                worst_d, worst_gap = d, gap
+        if worst_d is None or worst_gap <= sym_tol:
+            break
+        d = worst_d
+        if e_by_d[d] <= e_by_d[-d]:
+            # + side is lower (or tied): seed -d from mirror(+d), re-relax the - side
+            src = mirror_through_rod_center(pos_by_d[d], u, rod_center)
+            relaxed, e, c, conv = relax_at(src, -d)
+            pos_by_d[-d], e_by_d[-d], c_by_d[-d], conv_by_d[-d] = \
+                relaxed.copy(), e, c, conv
+        else:
+            # - side is lower: seed +d from mirror(-d), re-relax the + side
+            src = mirror_through_rod_center(pos_by_d[-d], u, rod_center)
+            relaxed, e, c, conv = relax_at(src, d)
+            pos_by_d[d], e_by_d[d], c_by_d[d], conv_by_d[d] = \
+                relaxed.copy(), e, c, conv
+        new_gap = abs(e_by_d[d] - e_by_d[-d]) * EV_TO_KCAL_MOL
+        print(f"  sym agreement: |d|={d:.2f} A gap {worst_gap:.2f} -> "
+              f"{new_gap:.2f} kcal/mol (re-relaxed the higher side)", flush=True)
+
+    ds = np.array(sorted(e_by_d))
+    energies = np.array([e_by_d[d] for d in ds])
+    contacts = np.array([c_by_d[d] for d in ds])
+    converged = np.array([conv_by_d[d] for d in ds])
+    # Report the residual symmetry agreement so the user can see it held.
+    gaps = [abs(e_by_d[d] - e_by_d[-d]) * EV_TO_KCAL_MOL for d in pos_ds]
+    max_gap = max(gaps) if gaps else 0.0
+    print(f"scan(symmetric): max |E(+d) - E(-d)| = {max_gap:.3f} kcal/mol over "
+          f"{len(pos_ds)} mirror pairs", flush=True)
+    n_bad = int((~converged).sum())
+    if n_bad:
+        print(f"scan(symmetric): {n_bad} station(s) NOT converged -- excluded "
+              f"from well detection (use --production for more relax steps)",
+              flush=True)
+    return ds, energies, contacts, pos_by_d, converged
+
+
+def detect_wells(ds, energies, grid, pos_by_d, converged=None,
+                 smooth_pts=SMOOTH_PTS):
     """Identify shuttle wells (metastable side minima) on the scan curve.
 
     The chain landscape carries rod-conformer relaxation noise (~0.5-2
-    kcal/mol bumps), so we smooth before picking minima: a moving average over
-    a ~1.25 A window (window = round(1.25/grid), clamped >= 3 and odd). A local
-    minimum on the smoothed curve (lower than its +/-2 neighbours) is a
-    candidate. Candidates within 1.0 A of each other are merged to the deepest.
-    Smoothing only locates the basin (robust to noise); each basin is then
-    *snapped* to its deepest CONVERGED raw point, because the 1.25 A window
-    blurs a well with its adjacent barrier top and would otherwise shift the
-    reported minimum off the true floor by up to one grid step.
+    kcal/mol bumps), so we smooth before picking minima: a moving average over a
+    POINT-count window (smooth_pts, clamped >= 3 and odd). The window is in
+    points, not A, so it scales with the grid: ~1.25 A at 0.25 (the default,
+    unchanged) shrinking to 0.5 A at 0.1 -- narrow enough to resolve the ~0.4-A
+    stopper wells. (An A-fixed window would grow in point count as the grid
+    refines and smear narrow wells worse at finer grids.) A local minimum on the
+    smoothed curve (lower than its +/-2 neighbours) is a candidate. Candidates
+    within 1.0 A of each other are merged to the deepest. Smoothing only locates
+    the basin (robust to noise); each basin is then *snapped* to its deepest
+    CONVERGED raw point, so the window width never biases the reported depth.
 
     A candidate counts as a *well* only if it is separated from the global
     minimum by a real barrier: the maximum energy on the path between the
@@ -444,9 +802,12 @@ def detect_wells(ds, energies, grid, pos_by_d, converged=None):
     if bad.size:
         work[bad] = np.interp(bad, good, energies[good])
 
-    # Smooth over ~1.25 A (odd window >= 3) to suppress rod-conformer bumps.
-    w = int(round(1.25 / grid))
-    w = max(w, 3)
+    # Smooth over a POINT-count window (odd, >= 3) to suppress rod-conformer
+    # bumps. Point-count (not A) so the window shrinks with the grid and can
+    # resolve the ~0.4-A stopper wells at fine grids (an A-fixed window would
+    # smear them worse as the grid refines). Depth comes from the raw snapped
+    # floor below, so this only affects detection.
+    w = max(int(smooth_pts), 3)
     if w % 2 == 0:
         w += 1
     half = w // 2
@@ -517,14 +878,16 @@ def detect_wells(ds, energies, grid, pos_by_d, converged=None):
 
 
 def plot_scan(ds, energies, contacts, left, right, place_d, place_side,
-              out_png, emax=SCAN_EMAX, wells=None, d_min=None, e_min=None):
+              out_png, emax=SCAN_EMAX, wells=None, d_min=None, e_min=None,
+              engine=DEFAULT_ENGINE):
     """Write the energy-vs-position PNG. Energy is plotted relative to its min
     in kcal/mol; if `emax` is set (kcal/mol), the plot (not the CSV) is clipped
     at min + emax so a stray point doesn't flatten the landscape. The global
     minimum, each detected well, the (advisory) rigid stopper walls, and the
     placed station are marked. `e_min` is the converged-only global min (so a
     spurious NOT-converged low point doesn't shift the scale); defaults to
-    energies.min() when not supplied.
+    energies.min() when not supplied. `engine` labels the curve honestly (UMA
+    vs tblite/<method>).
     """
     import matplotlib
     matplotlib.use("Agg")
@@ -535,9 +898,10 @@ def plot_scan(ds, energies, contacts, left, right, place_d, place_side,
     rel = (energies - e_min) * EV_TO_KCAL_MOL  # relative energy, kcal/mol
     disp = np.clip(rel, None, emax) if emax is not None else rel
 
+    eng_label = "UMA" if engine == "uma" else "tblite"
     fig, ax = plt.subplots(figsize=(8, 4.5))
     ax.plot(ds, disp, "o-", ms=3, lw=1.0, color="tab:blue",
-            label="UMA relaxed energy, rel. to min")
+            label=f"{eng_label} relaxed energy, rel. to min")
     # Rigid stopper walls are advisory only: the chain scan threads past them, so
     # they just mark where a fresh rigid placement would first clash.
     ax.axvline(right, color="tab:red", ls="--", lw=1.0,
@@ -574,7 +938,7 @@ def plot_scan(ds, energies, contacts, left, right, place_d, place_side,
 
 
 def write_scan_csv(path, ds, energies, contacts, e_min=None):
-    """CSV with displacement, absolute UMA energy (eV, for traceability), the
+    """CSV with displacement, absolute engine energy (eV, for traceability), the
     relative energy in kcal/mol (the chemist-facing column), and the closest
     rod-wheel contact. `e_min` is the reference for the relative column; it
     defaults to energies.min() but should be the converged-only global min when
@@ -585,7 +949,7 @@ def write_scan_csv(path, ds, energies, contacts, e_min=None):
     rel_kcal = (energies - e_min) * EV_TO_KCAL_MOL
     with open(path, "w", newline="") as fh:
         w = csv.writer(fh)
-        w.writerow(["displacement_A", "energy_UMA_eV", "energy_rel_kcal_mol",
+        w.writerow(["displacement_A", "energy_eV", "energy_rel_kcal_mol",
                     "min_contact_A"])
         for d, e, rk, c in zip(ds, energies, rel_kcal, contacts):
             w.writerow([f"{d:.4f}", f"{e:.6f}", f"{rk:.4f}", f"{c:.4f}"])
@@ -701,12 +1065,28 @@ def main():
     p.add_argument("--smiles", default=None,
                    help="rod:/wheel: file for atom counts + charge/spin "
                         "(default: <stem>.txt matching the input)")
+    p.add_argument("--engine", default=DEFAULT_ENGINE, choices=ENGINES,
+                   help="force source for the scan relaxations: 'uma' (Meta UMA "
+                        "MLIP, default; needs HF_TOKEN) or 'tblite' (GFN-xTB; no "
+                        "HF_TOKEN, ~5x faster/step on CPU). A non-default engine "
+                        "tags outputs, e.g. <stem>_scan_tblite.csv / "
+                        "<stem>_displaced_tblite.xyz / <stem>_stations_tblite/, "
+                        "so the engines coexist on disk.")
+    p.add_argument("--method", default="GFN2-xTB",
+                   help="tblite method (default GFN2-xTB; also GFN1-xTB, GFN0-xTB, "
+                        "CEH). Ignored for --engine uma.")
     # scan options
     p.add_argument("--scan", dest="scan", action="store_true", default=True,
                    help="run the relaxed stability-vs-position scan (default on)")
     p.add_argument("--no-scan", dest="scan", action="store_false",
                    help="skip the scan; only write the displaced-isomer XYZ "
                         "(forces --place-rigid)")
+    p.add_argument("--dump-stations", action="store_true",
+                   help="write every station's relaxed geometry to "
+                        "output_files/<stem>_stations/d{:+.2f}.xyz so "
+                        "vib_stations.py can run constrained partial-Hessian "
+                        "free energies on the wells/saddles. Chain scans only "
+                        "(rigid --no-scan-chain keeps no per-station geometry).")
     p.add_argument("--scan-grid", type=float, default=SCAN_GRID,
                    help=f"scan spacing in A (default {SCAN_GRID})")
     p.add_argument("--scan-pad", type=float, default=SCAN_PAD,
@@ -752,10 +1132,52 @@ def main():
                    help="use the legacy rigid fresh-start scan (one left-to-"
                         "right pass, fresh rigid placement per station); cannot "
                         "map past a stopper, so no side wells are found")
+    p.add_argument("--scan-symmetric", dest="scan_symmetric", action="store_true",
+                   default=True,
+                   help="symmetric (mirror-seeded) chain scan (default on with "
+                        "--scan-chain): sweep only +u, then build the -u side by "
+                        "mirroring each +d relaxed geometry through the rod-center "
+                        "plane and re-relaxing. Both rods are end-to-end symmetric, "
+                        "so this removes the two-sweep hysteresis that otherwise "
+                        "lopsides the landscape (unequal mirror-side wells/"
+                        "barriers). d=0 is the rod center. A rod conformer pre-"
+                        "search (--scan-rod-conformers) seeds d=0 from the lowest-"
+                        "MMFF RDKit conformer instead of the fixed-seed single embed.")
+    p.add_argument("--no-scan-symmetric", dest="scan_symmetric",
+                   action="store_false",
+                   help="use the legacy two-sweep chain scan (independent +u and "
+                        "-u sweeps) -- recovers the asymmetric hysteresis result, "
+                        "useful as a comparison/regression check")
+    p.add_argument("--scan-sym-tol", type=float, default=SYM_TOL,
+                   help=f"kcal/mol: |E(+d) - E(-d)| above this re-relaxes the "
+                        f"higher side seeded from the mirror of the lower one "
+                        f"(agreement loop; default {SYM_TOL}). Rarely fires -- the "
+                        f"mirror seed is already a stationary point.")
+    p.add_argument("--scan-sym-iters", type=int, default=SYM_ITERS,
+                   help=f"max passes of the symmetry agreement loop (default "
+                        f"{SYM_ITERS})")
+    p.add_argument("--scan-smooth-pts", type=int, default=SMOOTH_PTS,
+                   help=f"moving-average window in POINTS for well detection "
+                        f"(default {SMOOTH_PTS}, odd, clamped >= 3). Point-count, "
+                        f"not A, so it shrinks with the grid and resolves the "
+                        f"~0.4-A stopper wells at fine grids (~1.25 A at 0.25, "
+                        f"0.5 A at 0.1) that an A-fixed 1.25 A window smears. "
+                        f"Raise to suppress noisier rods, lower to resolve "
+                        f"narrower wells. Only affects detection -- well depth "
+                        f"comes from the raw snapped floor.")
+    p.add_argument("--scan-rod-conformers", type=int, default=ROD_CONFORMERS,
+                   help=f"number of RDKit rod conformers to generate + MMFF-rank "
+                        f"for the symmetric d=0 seed (default {ROD_CONFORMERS}; "
+                        f"avoids the fixed-seed single-embed bias). 0 = use the "
+                        f"input rod as-is.")
+    p.add_argument("--no-scan-rod-conformers", dest="scan_rod_conformers",
+                   action="store_const", const=0,
+                   help="use the input rod geometry as the d=0 seed (skip the "
+                        "conformer pre-search)")
     args = p.parse_args()
 
     stem = resolve_stem(args.input)
-    out_file = args.out or out_path(stem, "displaced", "xyz")
+    out_file = args.out or out_path(stem, "displaced", "xyz", engine=args.engine)
     smiles_path = args.smiles or default_smiles(stem)
 
     atoms = read(args.input)
@@ -789,25 +1211,39 @@ def main():
     # a NOT-converged station reports an unreliable energy).
     scan_steps = max(args.scan_steps, 300) if args.production else args.scan_steps
 
-    # ---- relaxed stability-vs-position scan (UMA) ----
+    # ---- relaxed stability-vs-position scan ----
     if args.scan:
+        mode = ("symmetric" if (args.scan_chain and args.scan_symmetric)
+                else "chain" if args.scan_chain else "rigid")
         print(f"scan: grid={args.scan_grid} A fmax={args.scan_fmax} eV/A "
-              f"steps={scan_steps}  mode={'chain' if args.scan_chain else 'rigid'}"
+              f"steps={scan_steps}  mode={mode}  engine={args.engine}"
               f"{'  [production]' if args.production else ''}", flush=True)
-        if args.scan_chain:
+        if args.scan_chain and args.scan_symmetric:
+            ds, energies, contacts, pos_by_d, converged = run_scan_chain_sym(
+                symbols, pos, rod_n, u, smiles_path,
+                grid=args.scan_grid, fmax=args.scan_fmax, steps=scan_steps,
+                walk_emax=args.scan_walk_emax,
+                walk_contact=args.scan_walk_contact,
+                rod_conformers=args.scan_rod_conformers,
+                sym_tol=args.scan_sym_tol, sym_iters=args.scan_sym_iters,
+                engine=args.engine, method=args.method)
+        elif args.scan_chain:
             ds, energies, contacts, pos_by_d, converged = run_scan_chain(
                 symbols, pos, rod_n, u, smiles_path,
                 grid=args.scan_grid, fmax=args.scan_fmax, steps=scan_steps,
                 walk_emax=args.scan_walk_emax,
-                walk_contact=args.scan_walk_contact)
+                walk_contact=args.scan_walk_contact,
+                engine=args.engine, method=args.method)
         else:
             ds, energies, contacts, pos_by_d, converged = run_scan(
                 symbols, pos, rod_n, u, left, right, smiles_path,
                 grid=args.scan_grid, pad=args.scan_pad,
-                fmax=args.scan_fmax, steps=scan_steps)
+                fmax=args.scan_fmax, steps=scan_steps,
+                engine=args.engine, method=args.method)
         wells, d_min, e_min = detect_wells(ds, energies, args.scan_grid,
-                                           pos_by_d, converged)
-        scan_csv = out_path(stem, "scan", "csv")
+                                           pos_by_d, converged,
+                                           smooth_pts=args.scan_smooth_pts)
+        scan_csv = out_path(stem, "scan", "csv", engine=args.engine)
         write_scan_csv(scan_csv, ds, energies, contacts, e_min=e_min)
         print(f"scan: {len(ds)} points  global min at d={d_min:+.2f} A "
               f"(E={e_min:.4f} eV)")
@@ -824,6 +1260,26 @@ def main():
         if args.rates:
             print_rate_estimates(wells, temperature=args.rate_temp)
         print(f"wrote {scan_csv}", flush=True)
+
+        # Optional: persist every station's relaxed geometry so vib_stations.py
+        # can run constrained partial-Hessian free energies on the wells/saddles.
+        # pos_by_d is None on the rigid --no-scan-chain path (no per-station
+        # geometry), so guard it. Files are keyed by d at 2 decimals to match
+        # vib_stations' lookup. The dir is engine-tagged (rot2_stations/ for UMA,
+        # rot2_stations_tblite/ for tblite) so the two engines' station geometries
+        # don't collide; vib_stations.py is UMA-only today and looks up the
+        # untagged dir, so it continues to find UMA stations unchanged.
+        if args.dump_stations and pos_by_d is not None:
+            import os as _os
+            st_dir = _os.path.join(OUTPUT_DIR,
+                                   f"{stem}_stations{engine_tag(args.engine)}")
+            _os.makedirs(st_dir, exist_ok=True)
+            for d, p in pos_by_d.items():
+                st_path = _os.path.join(st_dir, f"d{d:+.2f}.xyz")
+                write_plain_xyz(st_path, symbols, p,
+                                comment=f"station d={d:+.2f} A  E={energies[np.argmin(np.abs(np.asarray(ds) - d))]:.6f} eV")
+            print(f"dumped {len(pos_by_d)} station geometries to {st_dir}/",
+                  flush=True)
 
     # ---- placement: at a detected well, or rigid stopper-wall fallback ----
     chosen = None
@@ -892,10 +1348,10 @@ def main():
 
     # ---- scan PNG (after placement so the placed marker is on it) ----
     if args.scan:
-        scan_png = out_path(stem, "scan", "png")
+        scan_png = out_path(stem, "scan", "png", engine=args.engine)
         plot_scan(ds, energies, contacts, left, right, place_d_signed,
                   place_side, scan_png, emax=args.scan_emax,
-                  wells=wells, d_min=d_min, e_min=e_min)
+                  wells=wells, d_min=d_min, e_min=e_min, engine=args.engine)
         print(f"wrote {scan_png}")
 
 

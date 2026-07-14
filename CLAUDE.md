@@ -41,6 +41,27 @@ complete these tasks and then output the combined molecule in xyz format for vis
   `default_smiles` defaults to the project root. all `--out-*` flags still exist
   to override. the default stem is `rot_smiles` (from `rot_smiles.txt`), so the
   old `rotaxane*` outputs are legacy.
+- **engine (force source).** optimize_uma / run_md / displace_wheel all take
+  `--engine uma|tblite` (default `uma`) + `--method` (tblite xTB method, default
+  `GFN2-xTB`; also GFN1-xTB / GFN0-xTB / CEH; ignored for uma). `uma` = Meta UMA
+  MLIP (`uma-s-1p1`, `omol`) via fairchem (needs `HF_TOKEN`, ~1.07 s/relax-step on
+  CPU). `tblite` = GFN-xTB tight-binding via the tblite ASE calculator (NO
+  `HF_TOKEN`, ~0.23 s/step, ~5x faster). the engine is chosen once per run and
+  the calculator is built by `make_calculator` in `optimize_uma.py`, which
+  imports the engine's libs *inside* the branch it uses -- so a single process
+  loads only one engine. this is structural, not stylistic: torch/fairchem and
+  tblite each bundle their own `libomp` and segfault (exit 139) if used in one
+  process; `KMP_DUPLICATE_LIB_OK` does not fix it. that is why the old top-level
+  `import torch` / `from fairchem.core import ...` moved OUT of module scope
+  (run_md / displace_wheel `from optimize_uma import ...`, so a module-level
+  torch import would pull torch into tblite runs too). **naming:** a non-default
+  engine tags every output, UMA keeps the legacy untagged names for back-compat:
+  `rot2_relaxed.xyz` (uma) vs `rot2_relaxed_tblite.xyz` (tblite); likewise
+  `<stem>_md_tblite.*`, `<stem>_scan_tblite.csv`/`.png`, `<stem>_displaced_tblite.xyz`,
+  and the `--dump-stations` dir `<stem>_stations_tblite/` (uma = `<stem>_stations/`).
+  `resolve_stem` strips the trailing engine tag *then* the role suffix, so the
+  pipeline chains on either engine end-to-end (`rot2_relaxed_tblite.xyz` -> stem
+  `rot2` -> `rot2_displaced_tblite.xyz`).
 - single project environment is `.venv` (Python 3.12, created with `uv`).
   it has `rdkit`, `fairchem-core` (brings `ase` + `torch`), installed via
   `uv pip install --python .venv/bin/python rdkit fairchem-core`.
@@ -62,10 +83,12 @@ complete these tasks and then output the combined molecule in xyz format for vis
      written by hand because ASE's xyz writer emits extended XYZ (forces + long
      Lattice/Properties comment) that PyMOL misreads. needs `HF_TOKEN` in the
      environment (huggingface access to the UMA weights) to download the
-     checkpoint. device auto-selects cuda if available else cpu (fairchem
-     only accepts cpu/cuda -- Apple Silicon MPS is not supported). charge
+     checkpoint -- UMA only; `--engine tblite` needs no token. device
+     auto-selects cuda if available else cpu (fairchem only accepts cpu/cuda --
+     Apple Silicon MPS is not supported; tblite has no torch device). charge
      and spin are read from optional `charge:`/`spin:` lines in `<stem>.txt`,
-     defaulting to 0 and 1.
+     defaulting to 0 and 1. CLI also: `--engine uma|tblite` (default uma),
+     `--method` (tblite GFN2-xTB).
   3. `code/displace_wheel.py` -- maps the shuttle landscape and places the MD
      start. does two things: (a) a **chain-seeded relaxed stability scan** -- two
      monotonic outward sweeps from the central relaxed minimum, each station
@@ -81,7 +104,7 @@ complete these tasks and then output the combined molecule in xyz format for vis
      (`--scan-fmax 0.05`, `--scan-steps 200`). writes `images/<stem>_scan.png`
      (energy vs displacement in kcal/mol, relative to the global min, with
      global-min and well markers) and `output_files/<stem>_scan.csv` (4-col:
-     displacement_A, energy_UMA_eV, energy_rel_kcal_mol, min_contact_A). the
+     displacement_A, energy_eV, energy_rel_kcal_mol, min_contact_A). the
      landscape is on the wheel-rigid / rod-endpoint-anchored constrained
      surface, so it includes some rod-conformer relaxation; well depths/barriers
      are on that surface, not the free PES. and (b) detects the scan's wells
@@ -115,7 +138,8 @@ complete these tasks and then output the combined molecule in xyz format for vis
      300; temperature for the Eyring rate-estimate block), `--no-rates` (skip the
      rate-estimate block), `--no-scan`,
      `--no-scan-chain` (legacy rigid fresh-start scan; cannot map past a
-     stopper). the scan summary prints an Eyring TST rate estimate per well --
+     stopper), `--engine uma|tblite` (default uma; tblite tags scan/displaced/
+     stations outputs `_tblite`), `--method` (tblite GFN2-xTB). the scan summary prints an Eyring TST rate estimate per well --
      escape (well -> global min, over the well's barrier) and entry (global min
      -> well, over the same saddle, = rel_kcal + barrier) as k and tau at
      --rate-temp; ESTIMATE only (constrained-surface potential barriers treated
@@ -136,8 +160,10 @@ complete these tasks and then output the combined molecule in xyz format for vis
      default | nve), `--temperature` (K, default 300), `--friction` (1/fs,
      default 0.01), `--stride`, `--seed`, `--input` (default
      `output_files/<stem>_relaxed.xyz`), `--out-xyz`, `--out-pdb` (defaults
-     `output_files/<stem>_md.xyz` / `output_files/<stem>_md.pdb`), `--smiles`. reuses helpers from
-     optimize_uma.py. same HF_TOKEN / device / charge-spin rules.
+     `output_files/<stem>_md.xyz` / `output_files/<stem>_md.pdb`), `--smiles`,
+     `--engine uma|tblite` (default uma; tblite tags md outputs `_tblite`),
+     `--method` (tblite GFN2-xTB). reuses helpers from
+     optimize_uma.py. same HF_TOKEN (uma only) / device / charge-spin rules.
   5. `code/plot_md.py` -- plots MD observables from a run_md.py stdout log + the
      multi-state PDB. CLI: `--log`, `--pdb` (default `output_files/<stem>_md.pdb`, also sets
      the stem), `--prefix` (default `images/<stem>_md_`), `--dt`, `--log-interval`,
