@@ -61,7 +61,14 @@ complete these tasks and then output the combined molecule in xyz format for vis
   and the `--dump-stations` dir `<stem>_stations_tblite/` (uma = `<stem>_stations/`).
   `resolve_stem` strips the trailing engine tag *then* the role suffix, so the
   pipeline chains on either engine end-to-end (`rot2_relaxed_tblite.xyz` -> stem
-  `rot2` -> `rot2_displaced_tblite.xyz`).
+  `rot2` -> `rot2_displaced_tblite.xyz`). the vib/free-energy tools take `--engine`
+  too: `vib_stations.py --engine tblite` builds a GFN2-xTB partial Hessian (no
+  HF_TOKEN, ~5x faster than the UMA Hessian -> a full central-difference Hessian
+  is tractable) and reads the tagged `<stem>_scan_tblite.csv` +
+  `<stem>_stations_tblite/` (so the vib engine MUST match the scan engine);
+  `plot_freeenergy.py --engine tblite` reads the tagged `<stem>_freeenergy_tblite.csv`.
+  UMA (default) stays untagged. the freeenergy CSV + view PDB/xyz are tagged the
+  same way (`<stem>_freeenergy_tblite.csv`, `<stem>_vibstations_tblite/`).
 - single project environment is `.venv` (Python 3.12, created with `uv`).
   it has `rdkit`, `fairchem-core` (brings `ase` + `torch`), installed via
   `uv pip install --python .venv/bin/python rdkit fairchem-core`.
