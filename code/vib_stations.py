@@ -142,6 +142,22 @@ def parse_args():
     p.add_argument("--stations", default="auto",
                    help="'auto' (global min + wells + their saddles from the scan "
                         "CSV) or an explicit d list like '0.5,-0.5,0.0,3.5,-3.5'")
+    p.add_argument("--all-stations", action="store_true",
+                   help="with --stations auto, ALSO run every Nth dumped scan "
+                        "station so vib covers the whole shuttle coordinate (a "
+                        "dense G(d) curve in addition to the auto "
+                        "wells/saddles/global min, which are kept so the barrier "
+                        "block still pairs them). --all-stations-step sets the "
+                        "spacing (A, default 0.20); each target d is snapped to "
+                        "the nearest dumped station geometry. Should be a multiple "
+                        "of the 0.10 A scan grid so targets land on real stations. "
+                        "Cost GFN2: ~N x ~65 s (~53 stations at 0.20 A over "
+                        "-4.7..4.7 -> ~55 min serial).")
+    p.add_argument("--all-stations-step", type=float, default=0.20,
+                   help="A: spacing of the --all-stations dense curve (default "
+                        "0.20 -- a multiple of the 0.10 A scan grid so targets "
+                        "land on dumped stations). Snapped to the nearest dumped "
+                        "scan station.")
     p.add_argument("--n-procs", type=int, default=1,
                    help="ASE Vibrations parallel workers sharing the scratch cache "
                         "(file-based). 1 = serial. >1 spawns K procs for an ~Kx "
@@ -313,6 +329,27 @@ def station_geometry_path(stem, d, engine=DEFAULT_ENGINE):
                         f"d{d:+.2f}.xyz")
 
 
+def list_station_ds(stem, engine=DEFAULT_ENGINE):
+    """Sorted d values of every dumped station geometry in
+    ``<stem>_stations[_engine]/`` (written by displace_wheel --dump-stations).
+    Filenames are ``d{d:+.2f}.xyz`` -> parse the signed float after the leading
+    'd' (e.g. ``d-1.40.xyz`` -> -1.40, ``d+0.00.xyz`` -> 0.0). Used by
+    --all-stations to walk the whole shuttle coordinate."""
+    d = os.path.join(OUTPUT_DIR, f"{stem}_stations{engine_tag(engine)}")
+    out = []
+    if not os.path.isdir(d):
+        return out
+    for name in os.listdir(d):
+        if not (name.startswith("d") and name.endswith(".xyz")):
+            continue
+        try:
+            out.append(float(name[1:-4]))
+        except ValueError:
+            continue
+    out.sort()
+    return out
+
+
 def run_station(atoms, fix_idx, relax_fmax, delta, temperature, scratch, label,
                 compute_vib=True):
     """Tight-relax the free atoms on the wheel-position-constrained surface,
@@ -426,19 +463,49 @@ def main():
           f"global min d={d_min:+.2f} A  E={e_min:.6f} eV")
 
     # Resolve the station set (role, d).
-    stations = [("global_min", d_min)]
-    for w in wells:
-        stations.append(("well", w["d"]))
-        stations.append((f"saddle({w['side']})", w["saddle_d"]))
     if args.stations != "auto":
         stations = [("explicit", float(x)) for x in args.stations.split(",")]
-    # de-dup by rounded d (well + saddle can coincide at coarse grids)
+    else:
+        # auto = global min + wells + their saddles. The barrier block below
+        # pairs wells with saddles by role, so these are always included.
+        stations = [("global_min", d_min)]
+        for w in wells:
+            stations.append(("well", w["d"]))
+            stations.append((f"saddle({w['side']})", w["saddle_d"]))
+        # --all-stations: ALSO run every Nth dumped scan station so vib covers the
+        # whole shuttle coordinate (dense G(d) curve). Targets are n*step, each
+        # snapped to the nearest dumped station geometry; step should be a
+        # multiple of the 0.10 A scan grid so targets land on real stations. The
+        # auto wells/saddles above are kept (de-dup below drops the 'scan' label
+        # where a well/saddle already sits, so roles survive for the barrier
+        # block).
+        if args.all_stations:
+            avail = list_station_ds(stem, engine=args.engine)
+            if not avail:
+                print(f"vib_stations: --all-stations but no station geometries in "
+                      f"{stem}_stations{engine_tag(args.engine)}/ -- run "
+                      f"displace_wheel.py --engine {args.engine} --dump-stations.",
+                      flush=True)
+            else:
+                step = args.all_stations_step
+                a_min, a_max = avail[0], avail[-1]
+                n_lo = int(np.floor(a_min / step))
+                n_hi = int(np.ceil(a_max / step))
+                av = np.asarray(avail)
+                for n in range(n_lo, n_hi + 1):
+                    tgt = n * step
+                    j = int(np.argmin(np.abs(av - tgt)))
+                    stations.append(("scan", float(avail[j])))
+    # de-dup by rounded d (well + saddle + scan can coincide at coarse grids;
+    # auto roles are added first so they win over a coincident 'scan' label)
     seen = {}
     for role, d in stations:
         key = round(d, 2)
         if key not in seen:
             seen[key] = (role, d)
     stations = list(seen.values())
+    # Run left -> right by d so progress is monotonic and the CSV is ordered.
+    stations.sort(key=lambda rd: rd[1])
     print(f"vib_stations: {len(stations)} stations to analyse:")
     for role, d in stations:
         e = energies[np.argmin(np.abs(ds - d))]

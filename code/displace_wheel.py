@@ -1081,12 +1081,18 @@ def main():
     p.add_argument("--no-scan", dest="scan", action="store_false",
                    help="skip the scan; only write the displaced-isomer XYZ "
                         "(forces --place-rigid)")
-    p.add_argument("--dump-stations", action="store_true",
+    p.add_argument("--dump-stations", dest="dump_stations",
+                   action="store_true", default=True,
                    help="write every station's relaxed geometry to "
                         "output_files/<stem>_stations/d{:+.2f}.xyz so "
                         "vib_stations.py can run constrained partial-Hessian "
-                        "free energies on the wells/saddles. Chain scans only "
-                        "(rigid --no-scan-chain keeps no per-station geometry).")
+                        "free energies on the wells/saddles. ON by default; "
+                        "chain scans only (rigid --no-scan-chain keeps no "
+                        "per-station geometry, so nothing is written).")
+    p.add_argument("--no-dump-stations", dest="dump_stations",
+                   action="store_false",
+                   help="skip writing the per-station geometries "
+                        "(vib_stations.py will then have nothing to read).")
     p.add_argument("--scan-grid", type=float, default=SCAN_GRID,
                    help=f"scan spacing in A (default {SCAN_GRID})")
     p.add_argument("--scan-pad", type=float, default=SCAN_PAD,

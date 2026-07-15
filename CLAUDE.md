@@ -58,7 +58,8 @@ complete these tasks and then output the combined molecule in xyz format for vis
   engine tags every output, UMA keeps the legacy untagged names for back-compat:
   `rot2_relaxed.xyz` (uma) vs `rot2_relaxed_tblite.xyz` (tblite); likewise
   `<stem>_md_tblite.*`, `<stem>_scan_tblite.csv`/`.png`, `<stem>_displaced_tblite.xyz`,
-  and the `--dump-stations` dir `<stem>_stations_tblite/` (uma = `<stem>_stations/`).
+  and the stations dir `<stem>_stations_tblite/` (uma = `<stem>_stations/`),
+  written by `--dump-stations` (ON by default; `--no-dump-stations` to skip).
   `resolve_stem` strips the trailing engine tag *then* the role suffix, so the
   pipeline chains on either engine end-to-end (`rot2_relaxed_tblite.xyz` -> stem
   `rot2` -> `rot2_displaced_tblite.xyz`). the vib/free-energy tools take `--engine`
@@ -145,7 +146,9 @@ complete these tasks and then output the combined molecule in xyz format for vis
      300; temperature for the Eyring rate-estimate block), `--no-rates` (skip the
      rate-estimate block), `--no-scan`,
      `--no-scan-chain` (legacy rigid fresh-start scan; cannot map past a
-     stopper), `--engine uma|tblite` (default uma; tblite tags scan/displaced/
+     stopper), `--dump-stations` (ON by default; write every station's relaxed
+     geometry to `<stem>_stations[_engine]/` for vib_stations.py; `--no-dump-stations`
+     to skip), `--engine uma|tblite` (default uma; tblite tags scan/displaced/
      stations outputs `_tblite`), `--method` (tblite GFN2-xTB). the scan summary prints an Eyring TST rate estimate per well --
      escape (well -> global min, over the well's barrier) and entry (global min
      -> well, over the same saddle, = rel_kcal + barrier) as k and tau at

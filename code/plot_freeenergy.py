@@ -1,15 +1,21 @@
 #!/usr/bin/env python
 """Plot potential energy and Gibbs free energy along the rot2 relaxed scan.
 
-Overlays, all referenced to the d=+0.80 station (the scan's global min):
-  - scan DeltaE potential curve (81 pts, fmax 0.05) -- from <stem>_scan.csv
-  - vib DeltaE_relaxed (7 stations, tight fmax 0.005) -- from <stem>_freeenergy.csv
-  - vib DeltaG = E_relaxed + F_vib at T=300 K (7 stations)
+Overlays, all referenced to the scan global-min station (the role=global_min
+row of the freeenergy CSV):
+  - scan DeltaE potential curve (fmax 0.05) -- from <stem>_scan.csv
+  - vib DeltaE_relaxed -- from <stem>_freeenergy.csv. With --relax-fmax 0
+    (fork 1, rigid self-consistent) the Hessian is taken on the scan's OWN
+    converged geometry, so E_relaxed is on the SAME surface as the scan and
+    these points sit ON the scan DeltaE curve (a self-consistency check); only
+    DeltaG = E_relaxed + F_vib separates from it. With the old tight re-relax
+    (fmax 0.005) they instead diverge as the over-relaxed rod collapses.
+  - vib DeltaG = E_relaxed + F_vib at T=300 K
 
-The scan and vib potential energies are on DIFFERENT relaxation surfaces
-(fmax 0.05 vs 0.005), so they share only the d=+0.80 reference point and
-diverge elsewhere -- the tight relax pulls the strained stopper stations down
-(visible as the vib points dropping well below the scan curve at the ends).
+With vib_stations --all-stations the freeenergy CSV carries a dense 'scan'
+curve (every Nth station) PLUS the auto global_min/well/saddle stations; the
+'scan' rows are drawn as a line + small dots and the well/saddle/global_min
+rows as larger annotated markers (the discrete well/barrier overlay).
 
 Run from the project root:
     .venv/bin/python code/plot_freeenergy.py [--stem rot2]
@@ -82,7 +88,8 @@ def main():
         r["dG"] = (r["G_eV"] - G0) * EV_TO_KCAL
 
     # ---- table ----
-    print(f"\n=== {stem}: energy + Gibbs along the relaxed scan (ref: d=+0.80) ===")
+    print(f"\n=== {stem}: energy + Gibbs along the relaxed scan "
+          f"(ref: d={ref['d']:+.2f}, role=global_min) ===")
     print(f"{'role':>12} {'d_grid':>7} {'d_relax':>8} | {'scan dE':>8} {'vib dE':>8} {'vib dG':>8} | {'Fvib':>6} {'nimag':>5}")
     # scan dE at each station's grid d (nearest scan point)
     def scan_de_at(d):
@@ -101,24 +108,47 @@ def main():
     ax.axhline(0, color="#ccc", lw=0.8, zorder=0)
 
     sd = sorted(st, key=lambda r: r["d"])
-    ax.plot([r["d"] for r in sd], [r["dE_relaxed"] for r in sd],
-            "s--", color="#1f77b4", ms=7, zorder=3,
-            label=r"vib $\Delta E_{relaxed}$ (potential, tight fmax 0.005)")
-    ax.plot([r["d"] for r in sd], [r["dG"] for r in sd],
-            "o-", color="#d62728", ms=8, zorder=4,
-            label=r"vib $\Delta G = E_{relaxed}+F_{vib}$ (T=300 K)")
+    scan_rows = [r for r in sd if r["role"] == "scan"]
+    key_rows = [r for r in sd if r["role"] != "scan"]
 
-    role_marker = {"global_min": ("*", 16), "well": ("o", 8), "saddle(left)": ("^", 8),
-                   "saddle(right)": ("^", 8)}
-    for r in sd:
-        ax.annotate(r["role"].split("(")[0], (r["d"], r["dG"]),
-                    textcoords="offset points", xytext=(6, 6), fontsize=7,
-                    color="#d62728")
-    gmin = next(r for r in st if r["role"] == "global_min")
-    ax.plot(gmin["d"], gmin["dG"], "*", color="#d62728", ms=16, zorder=5)
+    if scan_rows:
+        # Dense --all-stations curve: line + small dots, no per-point annotation.
+        ax.plot([r["d"] for r in scan_rows],
+                [r["dE_relaxed"] for r in scan_rows],
+                "s-", color="#1f77b4", ms=3, lw=1.0, alpha=0.7, zorder=2,
+                label=r"vib $\Delta E_{relaxed}$ (rigid, self-consistent w/ scan)")
+        ax.plot([r["d"] for r in scan_rows], [r["dG"] for r in scan_rows],
+                "o-", color="#d62728", ms=3, lw=1.4, zorder=3,
+                label=r"vib $\Delta G = E_{relaxed}+F_{vib}$ (T=300 K)")
+        # Auto wells/saddles/global_min: larger markers + annotations on top.
+        ax.plot([r["d"] for r in key_rows],
+                [r["dE_relaxed"] for r in key_rows],
+                "s", color="#1f77b4", ms=8, zorder=4)
+        ax.plot([r["d"] for r in key_rows], [r["dG"] for r in key_rows],
+                "o", color="#d62728", ms=8, zorder=5,
+                label="well / saddle / global-min stations")
+        for r in key_rows:
+            ax.annotate(r["role"].split("(")[0], (r["d"], r["dG"]),
+                        textcoords="offset points", xytext=(6, 6), fontsize=7,
+                        color="#d62728")
+    else:
+        # Legacy 5-station CSV (no 'scan' rows): plot all as annotated markers.
+        ax.plot([r["d"] for r in sd], [r["dE_relaxed"] for r in sd],
+                "s--", color="#1f77b4", ms=7, zorder=3,
+                label=r"vib $\Delta E_{relaxed}$ (potential)")
+        ax.plot([r["d"] for r in sd], [r["dG"] for r in sd],
+                "o-", color="#d62728", ms=8, zorder=4,
+                label=r"vib $\Delta G = E_{relaxed}+F_{vib}$ (T=300 K)")
+        for r in sd:
+            ax.annotate(r["role"].split("(")[0], (r["d"], r["dG"]),
+                        textcoords="offset points", xytext=(6, 6), fontsize=7,
+                        color="#d62728")
+    gmin = next((r for r in st if r["role"] == "global_min"), None)
+    if gmin is not None:
+        ax.plot(gmin["d"], gmin["dG"], "*", color="#d62728", ms=16, zorder=6)
 
     ax.set_xlabel("wheel displacement $d$ along rod (Å, grid)")
-    ax.set_ylabel("energy / free energy (kcal/mol, rel. to $d=+0.80$)")
+    ax.set_ylabel(f"energy / free energy (kcal/mol, rel. to $d={ref['d']:+.2f}$)")
     ax.set_title(f"{stem} ({args.engine}): potential vs Gibbs free energy along the shuttle scan")
     if args.emax:
         ax.set_ylim(top=args.emax)

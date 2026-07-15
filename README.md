@@ -346,6 +346,112 @@ naming; the stem-driven equivalent is
 
 ![Overview: 2x2 panel](images/md_overview.png)
 
+## Roadmap: vibrational free-energy (ΔG) shuttle landscape
+
+The scan gives **potential** shuttle barriers (well vs saddle, kcal/mol) and
+Eyring TST rate *estimates*. `vib_stations.py` adds a vibrational free-energy
+correction to turn those into **free-energy** barriers (ΔG = E_relaxed + F_vib),
+via a constrained partial Hessian (FixAtoms all wheel atoms + the 2 rod-tip
+anchors → Hessian over the free atoms only; the frozen reaction coordinate is
+removed, so a saddle is positive-definite too). See `code/vib_stations.py`
+header for the rationale.
+
+**Status (2026-07-15): the ΔG barrier is broken, and the cause is now pinned
+down — it is methodological, not the engine.** On both UMA *and* GFN2-xTB the
+free-energy barrier **inverts/collapses** (ΔG_saddle ≤ ΔG_well: left +1.06,
+right −0.08 kcal/mol vs the 6.4 kcal/mol potential barrier on GFN2). Root cause:
+the per-station **tight re-relax** (`vib_stations.py --relax-fmax 0.005`) does
+**not** hold the reaction coordinate d. Even with all 56 wheel atoms + the 2
+rod-tip atoms `FixAtoms`-pinned, the **rod bows** (residual RMSD up to ~12 Å) and
+`d_after` drifts +0.5–0.95 Å — so the scalar d is not geometrically frozen, the
+saddle relaxes down into the well, and the barrier vanishes. The `E_relaxed`
+column already shows the inversion *before* any F_vib is added. The GFN2 run
+reproduces the UMA failure mode exactly, just cheaper, which rules out the
+engine as the culprit. GFN2 *potential* scan is clean and perfectly symmetric
+(max |E(+d)−E(−d)| = 0.000 kcal/mol over 47 mirror pairs; 2 wells at d=±1.40 Å,
+barrier 6.4; no stopper wells — the wheel climbs monotonically to the rod tips).
+
+GFN2 run outputs (all `_tblite`-tagged): `output_files/rot2_relaxed_tblite.xyz`,
+`rot2_scan_tblite.csv`/`.png`, `rot2_displaced_tblite.xyz`, `rot2_stations_tblite/`
+(95 stations), `rot2_freeenergy_tblite.csv`, `rot2_vibstations_tblite/` +
+`rot2_vibstations_view_tblite.pdb`, `images/rot2_freeenergy_tblite.png`.
+
+### Forks (fork 1 chosen, others kept open)
+
+1. **Rigid self-consistent (CHOSEN, DONE 2026-07-15).** Take the Hessian on the
+   scan's *own* converged geometry — **no re-relax** (`--relax-fmax 0`, the relax
+   block is skipped when fmax is 0) — so E and F_vib come from the *same*
+   converged geometry and d cannot drift. ΔG(d) = E_scan(d) + F_vib(d); the
+   barrier is read off the continuous curve. Keeps the 6.4 kcal/mol potential
+   barrier and adds the rod-flex entropic correction.
+   - **Result (rot2, GFN2, `--all-stations --all-stations-step 0.20`,
+     51 stations, ~56 min):** self-consistency is *exact* —
+     `max|E_relaxed − E_scan| = 0.00 kcal` and `max|d_shift| = 0.00 Å` across all
+     stations (vs the broken tight-relax run's d_shift +0.47…+0.95 and inverted
+     ΔG +1.06/−0.08). The ΔG inversion is gone: **shuttle barrier (well → well
+     over the ±1.3 saddle) ≈ +9.4 kcal/mol** (left 9.73 / right 9.07), = the
+     +6.36 potential barrier + ~3 kcal F_vib (saddle stiffer than well). The
+     **free-energy minima are the side wells at d=±1.4** (G_rel ≈ −0.5…−1.4,
+     *below* the d=0 potential min): the wheel is vibrationally freer at the
+     wells (F_vib ~193–194) than at the center (~199), so entropy shifts the
+     equilibrium out of d=0; d=0 becomes a shallow local free-energy max between
+     the wells. Central barrier region symmetric to ~1 kcal.
+   - **Caveat (confirmed).** The Hessian is taken at a *loose*-converged
+     geometry (scan fmax 0.05), so small residual free-atom forces give 1–3 tiny
+     imaginary modes per station (even at the global min); these are *dropped
+     from the thermo* (`ignore_imag_modes=True`, real freqs only) and don't enter
+     F_vib. The fluctuating dropped-mode count adds up to ~3 kcal of F_vib noise
+     at the strained rod-tip ends (`max|G(+d)−G(−d)| ≈ 3.3 kcal`); the central
+     barrier region is clean. For publication-quality ends, tighten the *scan*
+     (`displace_wheel --scan-fmax 0.01`) so the station geometry is a cleaner
+     stationary point in the free-atom subspace.
+2. **Free-wheel 1D PMF (kept open).** Drop the rigid-wheel approximation: write
+   a custom ASE constraint that holds the scalar d = (wheel_centroid −
+   rod_centroid)·u fixed while the wheel is free to deform/rotate, and sample a
+   1D PMF in d. Gives the *real* (lower) threading barrier. Needs new constraint
+   code + a full re-run. Most correct of the ASE-native options; more work.
+3. **WT-MetaD, Leanza route (kept open, most rigorous).** Well-Tempered
+   Metadynamics with 2 CVs (CV1 = d along axle, CV2 = wheel-internal
+   benzene–benzene distance) + explicit solvent, then *separate* infrequent
+   WT-MetaD for kinetics (do **not** read ΔG‡ off the thermo run). Reference:
+   Leanza et al., *Chem. Sci.* 2023, 14, 6716–6729 (DOI 10.1039/d3sc01593a),
+   PDF at `rotaxane_md.pdf`, plumID 23.021 (ESI has the numbers). UMA-on-CPU
+   (~1.07 s/eval, MPS unsupported) makes ns-scale multi-walker sampling expensive;
+   ASE has no first-class WT-MetaD (drive via PLUMED-ASE or hand-roll the
+   history-dependent bias).
+
+### `vib_stations.py` — constrained partial-Hessian ΔG at scan stations
+
+| flag | default | description |
+|---|---|---|
+| `--input` | `<stem>_displaced.xyz` | stem source only (geometry NOT read); stations come from `<stem>_stations[_engine]/`. |
+| `--smiles` | `<stem>.txt` | rod/wheel file for atom counts. |
+| `--engine` | `uma` | must match the scan engine; tblite reads the `_tblite`-tagged CSV + stations dir. |
+| `--method` | `GFN2-xTB` | tblite method (ignored for uma). |
+| `--relax-fmax` | `0.005` eV/Å | tight re-relax of free atoms. **`0` = skip re-relax (fork-1 self-consistent mode; fixes the ΔG inversion).** |
+| `--rigid-wheel` / `--no-rigid-wheel` | on | FixAtoms all wheel atoms (default) vs pin only `--fix-wheel` spread atoms (does NOT hold d for the flexible crown-ether wheel — testing only). |
+| `--fix-wheel` | `3` | spread wheel atoms to pin (only with `--no-rigid-wheel`). |
+| `--no-rod-anchors` | off | don't fix the 2 rod-tip atoms. |
+| `--delta` | `0.01` Å | central-difference step for the Hessian. |
+| `--no-hessian` | off | constrained-relax only (no Hessian/thermo); saves the relaxed geometries. |
+| `--stations` | `auto` | `auto` = global min + wells + their saddles from the scan CSV, or an explicit `d1,d2,…` list. |
+| `--all-stations` | off | with `--stations auto`, ALSO run every Nth dumped scan station (dense G(d) curve) in addition to the auto wells/saddles/global min (kept so the barrier block still pairs them). Targets `n*step` snapped to the nearest dumped station. |
+| `--all-stations-step` | `0.20` Å | spacing of the `--all-stations` curve; a multiple of the 0.10 Å scan grid so targets land on real stations. |
+| `--barrier-min` | `3.0` kcal/mol | well/min separation threshold for `auto` station picking. |
+| `--smooth-pts` | smoothing window | rod-conformer-bump smoothing for well detection. |
+| `--temperature` | `300` K | thermo temperature for F_vib. |
+| `--n-procs` | `1` | parallel ASE Vibrations workers sharing a scratch cache. |
+| `--save-geometries` / `--no-save-geometries` | on | write relaxed station XYZs + a multi-state view PDB. |
+
+### `plot_freeenergy.py` — overlay potential + Gibbs along the scan
+
+| flag | default | description |
+|---|---|---|
+| `--stem` | `rot2` | stem of the scan + freeenergy CSVs. |
+| `--engine` | `uma` | engine tag of the CSVs to read (`tblite` → `_tblite`-tagged). Must match the vib_stations run. |
+| `--out` | `images/<stem>_freeenergy[_engine].png` | PNG path. |
+| `--emax` | none | kcal/mol y-axis clip. |
+
 ## Credits
 
 - RDKit for 3D embedding and SMILES handling.
