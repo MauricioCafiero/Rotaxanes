@@ -162,6 +162,19 @@ def parse_args():
                    help="ASE Vibrations parallel workers sharing the scratch cache "
                         "(file-based). 1 = serial. >1 spawns K procs for an ~Kx "
                         "Hessian speedup (memory permitting).")
+    p.add_argument("--resume", action="store_true",
+                   help="Continue a previous (killed or interrupted) run: read the "
+                        "existing <stem>_freeenergy[_engine].csv, skip stations "
+                        "already present (matched by d to 0.01 A), and append the "
+                        "rest. The CSV is written INCREMENTALLY (after every "
+                        "station), so a killed run leaves a complete partial CSV "
+                        "-- pass --resume on the next launch to finish it without "
+                        "recomputing finished stations. Aborts if the existing CSV "
+                        "contains stations absent from the current scan (a stale "
+                        "CSV from a different scan): back it up and remove it, or "
+                        "rerun without --resume. The per-station d*.xyz on disk "
+                        "are reused; the multi-state view PDB on a partial resume "
+                        "only includes newly-computed frames.")
     p.add_argument("--barrier-min", type=float, default=BARRIER_MIN,
                    help="kcal/mol: a local min counts as a well only if separated "
                         f"from the global min by > this (default {BARRIER_MIN}).")
@@ -216,6 +229,110 @@ def read_scan_csv(path):
             es.append(float(row[1]))
     order = np.argsort(ds)
     return np.asarray(ds)[order], np.asarray(es)[order]
+
+
+# Columns of the free-energy CSV (shared by the writer + the --resume parser).
+FREEENERGY_COLS = ["role", "d_A", "d_after_A", "d_shift_A", "E_relaxed_eV",
+                   "Fvib_eV", "Fvib_kcal_mol", "G_eV", "G_rel_kcal_mol",
+                   "n_imag", "barrier_kcal_mol"]
+
+
+def _barrier_map(results, wells):
+    """Pair wells with their saddles (role+side, matched on d within 0.05 A)
+    and return {(role, d): dG_kcal_mol} for the CSV's barrier column. Recomputed
+    from G_eV every write, so barriers fill in as soon as a well/saddle pair is
+    both present in `results` (e.g. incrementally, as the second of the pair
+    finishes)."""
+    by_role = {}
+    for r in results:
+        by_role.setdefault(r["role"], []).append(r)
+    barrier_for = {}
+    for w in wells:
+        side = w["side"]
+        wr = next((r for r in by_role.get("well", [])
+                   if abs(r["d"] - w["d"]) < 0.05), None)
+        sr = next((r for r in by_role.get(f"saddle({side})", [])
+                   if abs(r["d"] - w["saddle_d"]) < 0.05), None)
+        if wr and sr and wr["G_eV"] is not None and sr["G_eV"] is not None:
+            dG = (sr["G_eV"] - wr["G_eV"]) * EV_TO_KCAL_MOL
+            barrier_for[("well", wr["d"])] = dG
+            barrier_for[(f"saddle({side})", sr["d"])] = dG
+    return barrier_for
+
+
+def write_freeenergy_csv(csv_path, results, wells):
+    """Atomically (re)write the free-energy CSV from `results`.
+
+    Called after EVERY station completes (incremental checkpoint) so a kill
+    never loses a finished station's row -- the file is consistent at every
+    moment, with well/saddle barriers filled as their pair completes. Atomic:
+    write to <path>.tmp then os.replace, so a kill mid-write cannot leave a
+    torn/half-written file (fsync'd first)."""
+    import csv
+    barrier_for = _barrier_map(results, wells)
+
+    def cell(v, fmt):
+        return "" if v is None else fmt % v
+
+    tmp = csv_path + ".tmp"
+    with open(tmp, "w", newline="") as fh:
+        wtr = csv.writer(fh)
+        wtr.writerow(FREEENERGY_COLS)
+        for r in results:
+            b = barrier_for.get((r["role"], r["d"]), "")
+            wtr.writerow([r["role"], f"{r['d']:.2f}", f"{r['d_after']:.2f}",
+                          f"{r['d_shift']:+.2f}", f"{r['E_relaxed_eV']:.6f}",
+                          cell(r["Fvib_eV"], "%.6f"), cell(r["Fvib_kcal"], "%.2f"),
+                          cell(r["G_eV"], "%.6f"), cell(r["G_rel_kcal"], "%.2f"),
+                          "" if r["n_imag"] is None else r["n_imag"],
+                          f"{b:.2f}" if b != "" else ""])
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, csv_path)
+
+
+def parse_freeenergy_csv(csv_path):
+    """Read a free-energy CSV back into result dicts + the set of completed d
+    values (rounded to 0.01 A). Used by --resume to seed `results` (so the
+    end-of-run barrier pass and every incremental rewrite see the already-
+    completed stations) and to know which stations to skip. The barrier column
+    is NOT parsed -- it is recomputed from G_eV on write."""
+    import csv
+    results, done = [], set()
+    with open(csv_path, newline="") as fh:
+        r = csv.reader(fh)
+        header = next(r, None)
+        if header is None:
+            return [], set()
+        idx = {name: i for i, name in enumerate(header)}
+
+        def fget(row, name):
+            i = idx.get(name)
+            if i is None or i >= len(row) or row[i].strip() == "":
+                return None
+            return float(row[i])
+
+        for row in r:
+            if not row or not row[0].strip():
+                continue
+            d = fget(row, "d_A")
+            if d is None:
+                continue
+            ni = fget(row, "n_imag")
+            results.append({
+                "role": row[idx["role"]],
+                "d": d,
+                "d_after": fget(row, "d_after_A"),
+                "d_shift": fget(row, "d_shift_A"),
+                "E_relaxed_eV": fget(row, "E_relaxed_eV"),
+                "Fvib_eV": fget(row, "Fvib_eV"),
+                "Fvib_kcal": fget(row, "Fvib_kcal_mol"),
+                "G_eV": fget(row, "G_eV"),
+                "G_rel_kcal": fget(row, "G_rel_kcal_mol"),
+                "n_imag": (None if ni is None else int(round(ni))),
+            })
+            done.add(round(d, 2))
+    return results, done
 
 
 def identify_stations(ds, energies, smooth_pts=SMOOTH_PTS, barrier_min=BARRIER_MIN):
@@ -521,10 +638,66 @@ def main():
               flush=True)
     os.makedirs(scratch, exist_ok=True)
 
+    csv_path = out_path(stem, role="freeenergy", ext="csv", engine=args.engine)
+    meta_path = csv_path + ".meta"
+    run_meta = {
+        "stem": stem,
+        "engine": args.engine,
+        "all_stations_step": args.all_stations_step,
+        "n_stations": len(stations),
+        "scan_csv": os.path.basename(scan_csv),
+    }
     results = []
+    done_d = set()
+    if args.resume and os.path.exists(csv_path) and not args.no_hessian:
+        # Verify the on-disk CSV is from THIS run config before resuming. The
+        # d-sets of different scan grids can be nested (every 0.20 step is also
+        # a 0.10 step), so d-matching alone can't tell a stale 0.20 CSV from a
+        # partial 0.10 run -- the .meta sidecar does.
+        if not os.path.exists(meta_path):
+            sys.exit(f"vib_stations: --resume: {csv_path} exists but has no "
+                     f"{meta_path} sidecar -- it pre-dates the resume-safety check "
+                     f"or is from a different run. Back it up and remove it (and "
+                     f"the .meta), or rerun without --resume.")
+        import json
+        with open(meta_path) as fh:
+            old = json.load(fh)
+        mism = [k for k in ("stem", "engine", "all_stations_step", "n_stations",
+                            "scan_csv") if old.get(k) != run_meta.get(k)]
+        if mism:
+            sys.exit(f"vib_stations: --resume: {meta_path} differs from the "
+                     f"current run on {mism} -- {csv_path} is from a different "
+                     f"run. Back it up and remove it (and the .meta), or rerun "
+                     f"without --resume.")
+        prev, done_d = parse_freeenergy_csv(csv_path)
+        planned_d = {round(d, 2) for _, d in stations}
+        stale = done_d - planned_d
+        if stale:
+            sys.exit(f"vib_stations: --resume: {csv_path} contains stations "
+                     f"(d={sorted(stale)}) absent from the current scan's station "
+                     f"set -- it looks like a CSV from a different scan. Back it "
+                     f"up and remove it, or rerun without --resume.")
+        if prev:
+            results = prev
+            write_freeenergy_csv(csv_path, results, wells)  # rewrite clean state
+            print(f"vib_stations: --resume: {len(done_d)} station(s) already in "
+                  f"{csv_path} -- skipping them, appending the rest. (The view "
+                  f"PDB will only include newly-computed frames; the per-station "
+                  f"d*.xyz on disk are reused.)", flush=True)
+        else:
+            print(f"vib_stations: --resume: {csv_path} parsed no rows; starting "
+                  f"fresh.", flush=True)
+    if not args.no_hessian:
+        import json
+        with open(meta_path, "w") as fh:
+            json.dump(run_meta, fh, indent=2)
     saved_frames = []
     t_start = time.time()
     for role, d in stations:
+        if round(d, 2) in done_d:
+            print(f"  [{role} d={d:+.2f}] already in {csv_path} (--resume) -- skip",
+                  flush=True)
+            continue
         st_path = station_geometry_path(stem, d, engine=args.engine)
         if not os.path.exists(st_path):
             print(f"  [{role} d={d:+.2f}] MISSING station geometry {st_path} -- "
@@ -594,6 +767,8 @@ def main():
             "G_rel_kcal": ((G - e_min) * EV_TO_KCAL_MOL) if G is not None else None,
             "n_imag": n_imag,
         })
+        if not args.no_hessian:
+            write_freeenergy_csv(csv_path, results, wells)  # incremental checkpoint
         if F_vib is not None:
             print(f"  [{role} d={d:+.2f}] E_relaxed={E_rel:.6f} eV  "
                   f"F_vib={F_vib:.4f} eV ({F_vib*EV_TO_KCAL_MOL:.1f} kcal)  "
@@ -661,41 +836,17 @@ def main():
               f"(scan barrier was {w['barrier_kcal']:.2f})  "
               f"[F_vib correction {dG-dE:+.2f}]")
 
-    # Write the CSV. Skipped under --no-hessian: only E_relaxed (no F_vib/G) is
-    # available, so a partial CSV would be misleading -- and it would CLOBBER a
-    # full freeenergy.csv from a prior Hessian run. The geometry-only re-run's
-    # purpose is the view PDB; the full CSV already exists from the Hessian run.
-    csv_path = out_path(stem, role="freeenergy", ext="csv", engine=args.engine)
+    # Final CSV pass. write_freeenergy_csv was already called after EVERY
+    # station (incremental checkpoint), so the file is current and a kill
+    # never loses a completed row; this final call just ensures every
+    # well/saddle barrier pair is filled. Skipped under --no-hessian: only
+    # E_relaxed (no F_vib/G) is available, so a partial CSV would mislead and
+    # would clobber a full freeenergy.csv from a prior Hessian run.
     if args.no_hessian:
         print(f"vib_stations: --no-hessian -> not writing {csv_path} (only "
               f"E_relaxed available; keep the full CSV from the Hessian run)")
     else:
-        import csv
-        with open(csv_path, "w", newline="") as fh:
-            wtr = csv.writer(fh)
-            wtr.writerow(["role", "d_A", "d_after_A", "d_shift_A", "E_relaxed_eV",
-                          "Fvib_eV", "Fvib_kcal_mol", "G_eV", "G_rel_kcal_mol",
-                          "n_imag", "barrier_kcal_mol"])
-            # attach barriers to wells/saddles
-            barrier_for = {}
-            for w in wells:
-                side = w["side"]
-                wr = next((r for r in by_role.get("well", []) if abs(r["d"]-w["d"])<0.05), None)
-                sr = next((r for r in by_role.get(f"saddle({side})", []) if abs(r["d"]-w["saddle_d"])<0.05), None)
-                if wr and sr and wr["G_eV"] is not None and sr["G_eV"] is not None:
-                    dG = (sr["G_eV"] - wr["G_eV"]) * EV_TO_KCAL_MOL
-                    barrier_for[("well", wr["d"])] = dG
-                    barrier_for[(f"saddle({side})", sr["d"])] = dG
-            for r in results:
-                b = barrier_for.get((r["role"], r["d"]), "")
-                def cell(v, fmt):
-                    return "" if v is None else fmt % v
-                wtr.writerow([r["role"], f"{r['d']:.2f}", f"{r['d_after']:.2f}",
-                              f"{r['d_shift']:+.2f}", f"{r['E_relaxed_eV']:.6f}",
-                              cell(r["Fvib_eV"], "%.6f"), cell(r["Fvib_kcal"], "%.2f"),
-                              cell(r["G_eV"], "%.6f"), cell(r["G_rel_kcal"], "%.2f"),
-                              "" if r["n_imag"] is None else r["n_imag"],
-                              f"{b:.2f}" if b != "" else ""])
+        write_freeenergy_csv(csv_path, results, wells)
         print(f"\nvib_stations: wrote {csv_path}")
     print(f"vib_stations: scratch (freq files) left at {scratch}")
 

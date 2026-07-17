@@ -1,0 +1,7 @@
+{
+  "stem": "rot2",
+  "engine": "tblite",
+  "all_stations_step": 0.1,
+  "n_stations": 121,
+  "scan_csv": "rot2_scan_tblite.csv"
+}
